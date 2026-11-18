@@ -29,7 +29,7 @@ jobs:
         run: |
           echo "::error::releases run from master, not $GITHUB_REF_NAME"
           exit 1
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ci/release.sh check
 
   ci:
@@ -44,7 +44,7 @@ jobs:
     outputs:
       version: ${{ steps.prepare.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - id: prepare
         run: echo "version=$(ci/release.sh prepare "$BUMP")" >> "$GITHUB_OUTPUT"
@@ -70,7 +70,7 @@ jobs:
     env:
       TOKEN_SECRET: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: v${{ needs.tag.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
@@ -87,7 +87,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: v${{ needs.tag.outputs.version }}
       - run: |

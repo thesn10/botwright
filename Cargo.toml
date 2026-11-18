@@ -25,28 +25,28 @@ signal = ["tokio/signal"]
 test-util = ["dep:serde", "dep:serde_json", "tokio/test-util"]
 
 [dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time", "macros"] }
-tokio-util = { version = "0.7.12", features = ["rt"] }
-futures = "0.3.31"
-tracing = "0.1.40"
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+futures = "0.3.34"
+tracing = "0.1.44"
 thiserror = "2"
-pin-project-lite = "0.2.14"
+pin-project-lite = "0.2.17"
 
 alloy1 = { package = "alloy", version = ">=1.1, <2", optional = true, default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "providers", "provider-http", "provider-ws", "pubsub", "rpc-types", "network", "signers", "signer-local", "sol-types", "contract", "consensus", "eips"] }
 alloy2 = { package = "alloy", version = "2", optional = true, default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "providers", "provider-http", "provider-ws", "pubsub", "rpc-types", "network", "signers", "signer-local", "sol-types", "contract", "consensus", "eips"] }
 hypersync-client = { version = "2", optional = true }
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.18", optional = true, default-features = false }
 axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1"] }
-lru = { version = "0.18", optional = true }
+lru = { version = "0.19", optional = true }
 
 [dev-dependencies]
 botwright = { path = ".", default-features = false, features = ["test-util"] }
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
-tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio = { version = "1.54", features = ["full", "test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 criterion = { version = "0.8", features = ["async_tokio"] }
