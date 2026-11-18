@@ -6,9 +6,10 @@ rust-version = "1.90"
 license = "Unlicense OR MIT OR Apache-2.0"
 description = "Framework for event-driven bots: collectors, strategies and executors with explicit delivery semantics"
 readme = "README.md"
+repository = "https://github.com/thesn10/botwright"
 keywords = ["mev", "bot", "ethereum", "alloy", "tokio"]
 categories = ["asynchronous", "cryptography::cryptocurrencies"]
-exclude = ["/.github"]
+exclude = ["/.github", "/ci", "/CLAUDE.md", "/deny.toml"]
 
 [features]
 default = ["evm-alloy1", "signal"]
