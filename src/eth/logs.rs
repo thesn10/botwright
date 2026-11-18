@@ -11,7 +11,7 @@ use super::alloy::network::{Ethereum, Network};
 use super::alloy::primitives::B256;
 use super::alloy::providers::{DynProvider, Provider};
 use super::alloy::rpc::types::{Filter, Log};
-use super::chain::{ChainItem, ChainOpts, Follower, Recent};
+use super::follower::{ChainItem, ChainOpts, Follower, Recent};
 use super::{ChainEvent, ProviderSource, transport};
 use crate::{Collector, CollectorError, Item};
 

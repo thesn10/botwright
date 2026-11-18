@@ -11,7 +11,7 @@ cargo clippy --all-targets --no-default-features --features evm-alloy2,signal,me
 cargo test --features mempool,hypersync,bundles,telegram,metrics,http,test-util
 ```
 
-The EVM integration tests in `tests/anvil.rs` need [`anvil`](https://getfoundry.sh) on `PATH` (or
+The EVM integration tests in `tests/anvil/` need [`anvil`](https://getfoundry.sh) on `PATH` (or
 its path in `ANVIL`). Without it they are skipped, unless `BOTWRIGHT_REQUIRE_ANVIL` is set:
 
 ```sh

@@ -3,7 +3,8 @@
 //! The backend is chosen with feature `evm-alloy1` (alloy 1.x) or `evm-alloy2` (alloy 2.x); code
 //! written against this module compiles unchanged with both.
 
-mod chain;
+mod blocks;
+mod follower;
 mod logs;
 mod source;
 mod tx;
@@ -37,12 +38,12 @@ pub use alloy::rpc::types::{
 pub use alloy::signers::{self, Signer, local::PrivateKeySigner};
 pub use alloy::{sol, sol_types};
 
-#[cfg(feature = "bundles")]
-pub use bundle::{Bundle, BundleAction, BundleExecutor};
-pub use chain::{
+pub use blocks::{
     BlockCollector, BlockCursor, BlockLogs, ChainEvent, FullBlockCollector, LogsInBlockCollector,
     PollFullBlockCollector,
 };
+#[cfg(feature = "bundles")]
+pub use bundle::{Bundle, BundleAction, BundleExecutor};
 #[cfg(feature = "hypersync")]
 pub use hypersync::HyperSyncBackfill;
 pub use logs::{LogBackfill, LogCollector, LogCursor, LogEvent, RpcBackfill};

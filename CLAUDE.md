@@ -25,7 +25,7 @@ cargo +1.90 check --all-targets --features $E                                   
 
 ## Architecture
 
-- **Static dispatch:** traits `Collector<E>`, `Strategy<E, A>`, `Executor<A>` use native async fns (RPITIT, `+ Send`), no `dyn`/`async_trait`. `EngineBuilder` (`src/engine/mod.rs`) captures each concrete type in a generic slot implementing a private entry trait (`CollectorEntry`/`StrategyEntry`/`ExecutorEntry::into_task` → `BoxFuture`). Only filters and router `handles` predicates are `dyn` closures.
+- **Static dispatch:** traits `Collector<E>`, `Strategy<E, A>`, `Executor<A>` use native async fns (RPITIT, `+ Send`), no `dyn`/`async_trait`. `EngineBuilder` (`src/engine/builder.rs`) captures each concrete type in a generic slot implementing a private entry trait (`entry.rs`: `CollectorEntry`/`StrategyEntry`/`ExecutorEntry::into_task` → `BoxFuture`). `wiring.rs` creates the channels per subscription, `run.rs` holds `Engine::run`, `handle.rs` the `EngineHandle`. Only filters and router `handles` predicates are `dyn` closures.
 - **Tasks:** one tokio task per collector, strategy and executor. There is no dispatcher: `collector_task.rs` pushes each `Envelope<E>` (`Arc<E>` + source, seq, received_at) directly into subscriber channels.
 - **Delivery per subscription** (`delivery.rs`). `Lossless` uses one mpsc per strategy; `DropNewest` a second mpsc (`try_send`). `DropOldest` uses a broadcast and `Latest` a watch, each shared per collector (own channel if filtered). `Dropped`/`Lagging` (high/low watermark) travel via atomic slots + a coalescing wake mpsc(1) (`signals.rs`). `OnFull::Abort` ends the engine.
 - **Strategy loop** (`strategy_task.rs`): a manual `poll_fn` rotates over system/lossless/drop-newest/wake branches for fairness and determinism. It publishes an idle flag for the test harness and runs `catch_unwind` around handlers. `OnPanic::Restart` rebuilds the strategy via its factory and sends `Restarted` + `GapUnfilled`.
@@ -35,7 +35,7 @@ cargo +1.90 check --all-targets --features $E                                   
 - **`test_util::Harness`:** runs the engine on its own thread with a paused current_thread runtime. It adds a capture executor and ends when `EngineHandle::is_idle()` holds twice in a row.
 - **`obs.rs`:** metric names, plus no-op stubs when feature `metrics` is off.
 - **`eth`:** facade over `alloy1`/`alloy2` (renamed deps, re-exported as `eth::alloy`). Code must compile with both backends.
-  - `chain.rs::Follower` follows newHeads (fallback: polling). It backfills headers and detects reorgs via `parent_hash`, sharing the `recent` buffer across reconnects.
+  - `blocks.rs` holds the block collectors, all built on `follower.rs::Follower`, which follows newHeads (fallback: polling). It backfills headers and detects reorgs via `parent_hash`, sharing the `recent` buffer across reconnects.
   - `LogCollector` (`logs.rs`) combines the logs subscription, a `LogBackfill` and its own `Follower`. A `Delivered` buffer (shared across reconnects) dedupes logs and emits `Removed` for blocks that left the chain, because Anvil never sends `removed: true`.
   - `ProviderSource::ws` opens WebSocket connections with alloy's auto-reconnect disabled (it would silently lose events).
   - `TransactionExecutor` fills and signs via a FillProvider (`CachedNonceManager`), broadcasts the raw tx to all endpoints and reports `TxFeedback` through a `ChannelCollector`.
