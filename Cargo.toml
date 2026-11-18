@@ -1,0 +1,83 @@
+[package]
+name = "botwright"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Unlicense OR MIT OR Apache-2.0"
+description = "Framework for event-driven bots: collectors, strategies and executors with explicit delivery semantics"
+readme = "README.md"
+keywords = ["mev", "bot", "ethereum", "alloy", "tokio"]
+categories = ["asynchronous", "cryptography::cryptocurrencies"]
+exclude = ["/.github"]
+
+[features]
+default = ["evm-alloy1", "signal"]
+evm-alloy1 = ["dep:alloy1"]
+evm-alloy2 = ["dep:alloy2"]
+mempool = ["dep:lru"]
+hypersync = ["dep:hypersync-client"]
+bundles = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+telegram = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+metrics = ["dep:metrics"]
+http = ["dep:axum", "dep:metrics-exporter-prometheus", "metrics", "tokio/net"]
+signal = ["tokio/signal"]
+test-util = ["dep:serde", "dep:serde_json", "tokio/test-util"]
+
+[dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.12", features = ["rt"] }
+futures = "0.3.31"
+tracing = "0.1.40"
+thiserror = "2"
+pin-project-lite = "0.2.14"
+
+alloy1 = { package = "alloy", version = ">=1.1, <2", optional = true, default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "providers", "provider-http", "provider-ws", "pubsub", "rpc-types", "network", "signers", "signer-local", "sol-types", "contract", "consensus", "eips"] }
+alloy2 = { package = "alloy", version = "2", optional = true, default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "providers", "provider-http", "provider-ws", "pubsub", "rpc-types", "network", "signers", "signer-local", "sol-types", "contract", "consensus", "eips"] }
+hypersync-client = { version = "2", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.18", optional = true, default-features = false }
+axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1"] }
+lru = { version = "0.18", optional = true }
+
+[dev-dependencies]
+botwright = { path = ".", default-features = false, features = ["test-util"] }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+tokio = { version = "1.40", features = ["full", "test-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+criterion = { version = "0.8", features = ["async_tokio"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "dispatch_latency"
+harness = false
+required-features = ["test-util"]
+
+[[example]]
+name = "interval_printer"
+
+[[example]]
+name = "replay_test"
+required-features = ["test-util"]
+
+[[example]]
+name = "block_logger"
+required-features = ["evm-alloy1"]
+
+[[example]]
+name = "logs_dry_run"
+required-features = ["evm-alloy1"]
+
+[[example]]
+name = "feedback_loop"
+required-features = ["evm-alloy1"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[package.metadata.docs.rs]
+features = ["evm-alloy1", "mempool", "hypersync", "bundles", "telegram", "metrics", "http", "signal", "test-util"]
+rustdoc-args = ["--cfg", "docsrs"]

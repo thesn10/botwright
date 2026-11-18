@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  EXTRAS: mempool,hypersync,bundles,telegram,metrics,http,test-util
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - name: core without features
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: default features
+        run: cargo clippy --all-targets -- -D warnings
+      - name: each feature on alloy 1.x
+        run: cargo hack clippy --each-feature --exclude-all-features --exclude-features evm-alloy2,default --features evm-alloy1 --all-targets -- -D warnings
+      - name: alloy 2.x with all extras
+        run: cargo clippy --all-targets --no-default-features --features evm-alloy2,signal,$EXTRAS -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            args: --no-default-features --features test-util
+          - name: alloy 1.x
+            args: --features mempool,hypersync,bundles,telegram,metrics,http,test-util
+          - name: alloy 2.x
+            args: --no-default-features --features evm-alloy2,signal,mempool,hypersync,bundles,telegram,metrics,http,test-util
+    name: test (${{ matrix.name }})
+    env:
+      BOTWRIGHT_REQUIRE_ANVIL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo test ${{ matrix.args }}
+
+  alloy-versions:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        alloy: [minimal, latest]
+    name: alloy 1.x (${{ matrix.alloy }})
+    env:
+      BOTWRIGHT_REQUIRE_ANVIL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: pin the oldest allowed alloy 1.x
+        if: matrix.alloy == 'minimal'
+        run: ./ci/pin-alloy1.sh 1.1.0
+      - name: newest alloy 1.x
+        if: matrix.alloy == 'latest'
+        run: cargo update
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
+      - run: cargo test --test anvil
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --features $EXTRAS
+
+  latency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: latency limit
+        run: cargo test --release --features test-util --test latency
+        env:
+          BOTWRIGHT_LATENCY_P50_US: "1000"
+          BOTWRIGHT_LATENCY_P99_US: "20000"
+      - name: benchmark
+        run: cargo bench --features test-util --bench dispatch_latency -- --warm-up-time 1 --measurement-time 3
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --features $EXTRAS
+        env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
