@@ -228,7 +228,6 @@ type HeadItems<H> = Pin<Box<dyn Stream<Item = Result<ChainItem<H>, CollectorErro
 struct Gap {
     from: u64,
     to: u64,
-    report: bool,
 }
 
 struct LogState<N: Network, B> {
@@ -240,6 +239,7 @@ struct LogState<N: Network, B> {
     depth: u64,
     delivered: Arc<Mutex<Delivered>>,
     gap: Option<Gap>,
+    repair_from: Option<u64>,
     queued: VecDeque<Item<LogEvent, LogCursor>>,
     last: Option<LogCursor>,
 }
@@ -250,7 +250,7 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
             if let Some(item) = self.queued.pop_front() {
                 return Ok(Some(item));
             }
-            if let Some(Gap { from, to, report }) = self.gap.take() {
+            if let Some(Gap { from, to }) = self.gap.take() {
                 let logs = self
                     .backfill
                     .backfill(&self.provider, &self.filter, from, to)
@@ -258,9 +258,11 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                 for log in logs {
                     self.added(log);
                 }
-                if report {
-                    self.queued.push_back(Item::GapFilled { from, to });
-                }
+                self.queued.push_back(Item::GapFilled { from, to });
+                continue;
+            }
+            if let Some(from) = self.repair_from.take() {
+                self.repair(from).await?;
                 continue;
             }
             tokio::select! {
@@ -308,19 +310,29 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                 for block in dropped.iter().rev() {
                     self.remove_block(block.number, Some(block.hash));
                 }
-                let head = self.provider.get_block_number().await.map_err(transport)?;
-                let from = common_ancestor.number + 1;
-                if head >= from {
-                    self.gap = Some(Gap {
-                        from,
-                        to: head,
-                        report: false,
-                    });
-                }
+                self.schedule_repair(common_ancestor.number + 1);
             }
             Item::GapFilled { .. } | Item::GapUnfilled { .. } => {}
         }
         Ok(())
+    }
+
+    async fn repair(&mut self, from: u64) -> Result<(), CollectorError> {
+        let head = self.provider.get_block_number().await.map_err(transport)?;
+        if head < from {
+            return Ok(());
+        }
+        let logs = RpcBackfill::default()
+            .backfill(&self.provider, &self.filter, from, head)
+            .await?;
+        for log in logs {
+            self.added(log);
+        }
+        Ok(())
+    }
+
+    fn schedule_repair(&mut self, from: u64) {
+        self.repair_from = Some(self.repair_from.map_or(from, |pending| pending.min(from)));
     }
 
     fn remove_block(&mut self, number: u64, hash: Option<B256>) {
@@ -377,7 +389,7 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
             }
         };
         if stale {
-            self.remove_block(position.block, None);
+            self.remove_from(position.block, None);
         }
         {
             let mut delivered = self.delivered.lock().expect("lock");
@@ -407,8 +419,32 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                 *h == hash && logs.iter().any(|l| l.log_index == log.log_index)
             });
         if known {
-            self.remove_block(number, Some(hash));
+            self.remove_from(number, Some(hash));
         }
+    }
+
+    fn remove_from(&mut self, number: u64, hash: Option<B256>) {
+        let descendants: Vec<u64> = {
+            let delivered = self.delivered.lock().expect("lock");
+            if !delivered
+                .blocks
+                .get(&number)
+                .is_some_and(|(h, _)| hash.is_none_or(|hash| hash == *h))
+            {
+                return;
+            }
+            delivered
+                .blocks
+                .range(number + 1..)
+                .rev()
+                .map(|(n, _)| *n)
+                .collect()
+        };
+        for block in descendants {
+            self.remove_block(block, None);
+        }
+        self.remove_block(number, hash);
+        self.schedule_repair(number);
     }
 }
 
@@ -448,11 +484,7 @@ where
         let gap = match from {
             Some(from) => {
                 let head = provider.get_block_number().await.map_err(transport)?;
-                (head >= from).then_some(Gap {
-                    from,
-                    to: head,
-                    report: true,
-                })
+                (head >= from).then_some(Gap { from, to: head })
             }
             None => None,
         };
@@ -465,6 +497,7 @@ where
             depth: self.chain.max_reorg_depth,
             delivered: Arc::clone(&self.delivered),
             gap,
+            repair_from: None,
             queued: VecDeque::new(),
             last: resume,
         };
@@ -472,5 +505,125 @@ where
             let item = state.next_item().await?;
             Ok(item.map(|item| (item.map_event(E::from), state)))
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::alloy::primitives::{Address, LogData, U64};
+    use super::super::alloy::providers::ProviderBuilder;
+    use super::super::alloy::transports::mock::Asserter;
+    use super::*;
+
+    fn log(block: u64, hash: u8, value: u8, removed: bool) -> Log {
+        Log {
+            inner: super::super::alloy::primitives::Log {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(Vec::new(), vec![value].into()),
+            },
+            block_hash: Some(B256::repeat_byte(hash)),
+            block_number: Some(block),
+            log_index: Some(0),
+            removed,
+            ..Default::default()
+        }
+    }
+
+    fn state(live: Vec<Log>, node: &Asserter) -> LogState<Ethereum, RpcBackfill> {
+        let provider = ProviderBuilder::new().connect_mocked_client(node.clone());
+        LogState {
+            provider: DynProvider::new(provider),
+            live: Box::pin(stream::iter(live)),
+            heads: Box::pin(stream::pending()),
+            filter: Filter::new(),
+            backfill: Arc::new(RpcBackfill::default()),
+            depth: 64,
+            delivered: Arc::default(),
+            gap: None,
+            repair_from: None,
+            queued: VecDeque::new(),
+            last: None,
+        }
+    }
+
+    fn canonical(node: &Asserter, head: u64, logs: Vec<Log>) {
+        node.push_success(&U64::from(head));
+        node.push_success(&logs);
+    }
+
+    async fn events(mut state: LogState<Ethereum, RpcBackfill>) -> Vec<(bool, u8)> {
+        let mut out = Vec::new();
+        while let Some(item) = state.next_item().await.unwrap() {
+            match item {
+                Item::Event {
+                    event: LogEvent::Added(log),
+                    ..
+                } => out.push((true, log.inner.data.data[0])),
+                Item::Event {
+                    event: LogEvent::Removed(log),
+                    ..
+                } => out.push((false, log.inner.data.data[0])),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn node_reported_removals_arrive_newest_first() {
+        let node = Asserter::new();
+        canonical(&node, 5, Vec::new());
+        let live = vec![
+            log(4, 0xa, 3, false),
+            log(5, 0xb, 4, false),
+            log(4, 0xa, 3, true),
+            log(5, 0xb, 4, true),
+        ];
+        assert_eq!(
+            events(state(live, &node)).await,
+            vec![(true, 3), (true, 4), (false, 4), (false, 3)]
+        );
+        assert!(node.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replaced_block_removes_its_descendants_newest_first() {
+        let node = Asserter::new();
+        canonical(&node, 4, vec![log(4, 0xc, 5, false)]);
+        let live = vec![
+            log(4, 0xa, 3, false),
+            log(5, 0xb, 4, false),
+            log(4, 0xc, 5, false),
+        ];
+        assert_eq!(
+            events(state(live, &node)).await,
+            vec![(true, 3), (true, 4), (false, 4), (false, 3), (true, 5)]
+        );
+        assert!(node.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_chain_log_before_the_removal_is_restored() {
+        let node = Asserter::new();
+        canonical(&node, 6, vec![log(6, 0xc, 5, false)]);
+        let live = vec![
+            log(4, 0xa, 3, false),
+            log(5, 0xb, 4, false),
+            log(6, 0xc, 5, false),
+            log(4, 0xa, 3, true),
+        ];
+        assert_eq!(
+            events(state(live, &node)).await,
+            vec![
+                (true, 3),
+                (true, 4),
+                (true, 5),
+                (false, 5),
+                (false, 4),
+                (false, 3),
+                (true, 5)
+            ]
+        );
+        assert!(node.read_q().is_empty());
     }
 }

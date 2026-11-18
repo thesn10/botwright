@@ -36,7 +36,7 @@ cargo +1.90 check --all-targets --features $E                                   
 - **`obs.rs`:** metric names, plus no-op stubs when feature `metrics` is off.
 - **`eth`:** facade over `alloy1`/`alloy2` (renamed deps, re-exported as `eth::alloy`). Code must compile with both backends.
   - `blocks.rs` holds the block collectors, all built on `follower.rs::Follower`, which follows newHeads (fallback: polling). It backfills headers and detects reorgs via `parent_hash`, sharing the `recent` buffer across reconnects.
-  - `LogCollector` (`logs.rs`) combines the logs subscription, a `LogBackfill` and its own `Follower`. A `Delivered` buffer (shared across reconnects) dedupes logs and emits `Removed` for blocks that left the chain, because Anvil never sends `removed: true`.
+  - `LogCollector` (`logs.rs`) combines the logs subscription, a `LogBackfill` and its own `Follower`. A `Delivered` buffer (shared across reconnects) dedupes logs and emits `Removed` for blocks that left the chain, because not every node sends `removed: true` (Anvil 1.7.1 does not, 1.8.6 does).
   - `ProviderSource::ws` opens WebSocket connections with alloy's auto-reconnect disabled (it would silently lose events).
   - `TransactionExecutor` fills and signs via a FillProvider (`CachedNonceManager`), broadcasts the raw tx to all endpoints and reports `TxFeedback` through a `ChannelCollector`.
 
