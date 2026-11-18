@@ -1,3 +1,16 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="botwright: event-driven bots for Rust" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://crates.io/crates/botwright"><img src="https://img.shields.io/crates/v/botwright.svg?logo=rust" alt="crates.io"></a>
+  <a href="https://docs.rs/botwright"><img src="https://img.shields.io/docsrs/botwright?logo=docs.rs" alt="docs.rs"></a>
+  <a href="https://github.com/thesn10/botwright/actions/workflows/ci.yml"><img src="https://github.com/thesn10/botwright/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/botwright"><img src="https://img.shields.io/crates/d/botwright.svg" alt="downloads"></a>
+  <img src="https://img.shields.io/badge/MSRV-1.90-orange.svg" alt="MSRV 1.90">
+  <img src="https://img.shields.io/crates/l/botwright.svg" alt="license">
+</p>
+
 # botwright
 
 A Rust framework for event-driven bots (MEV, liquidations, keepers, arbitrage, monitoring) built on

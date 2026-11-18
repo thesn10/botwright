@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="botwright: event-driven bots for Rust">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0f1c"/>
+      <stop offset="1" stop-color="#151b33"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff6a1a"/>
+      <stop offset="1" stop-color="#ffc35a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff7a2a" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ff7a2a" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.2" fill="#8b95b5"/>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="320" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="320" rx="24" fill="url(#dots)" opacity="0.12"/>
+  <circle cx="200" cy="160" r="150" fill="url(#glow)"/>
+
+  <g id="mark">
+    <line x1="200" y1="112" x2="200" y2="84" stroke="#ffa040" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="200" cy="76" r="9" fill="#ffc35a">
+      <animate attributeName="opacity" values="1;0.35;1" dur="2.4s" repeatCount="indefinite"/>
+    </circle>
+    <rect x="116" y="146" width="12" height="36" rx="5" fill="#ff8a3a"/>
+    <rect x="272" y="146" width="12" height="36" rx="5" fill="#ff8a3a"/>
+    <rect x="128" y="112" width="144" height="124" rx="30" fill="#121830" stroke="url(#accent)" stroke-width="6"/>
+    <rect x="148" y="138" width="104" height="48" rx="16" fill="#070a14"/>
+    <ellipse cx="180" cy="162" rx="8" ry="8" fill="#5eead4">
+      <animate attributeName="ry" values="8;8;1;8;8" keyTimes="0;0.9;0.94;0.98;1" dur="4s" repeatCount="indefinite"/>
+    </ellipse>
+    <ellipse cx="220" cy="162" rx="8" ry="8" fill="#5eead4">
+      <animate attributeName="ry" values="8;8;1;8;8" keyTimes="0;0.9;0.94;0.98;1" dur="4s" repeatCount="indefinite"/>
+    </ellipse>
+    <g stroke="#3b4670" stroke-width="5" stroke-linecap="round">
+      <line x1="172" y1="208" x2="172" y2="216"/>
+      <line x1="190" y1="208" x2="190" y2="216"/>
+      <line x1="208" y1="208" x2="208" y2="216"/>
+      <line x1="226" y1="208" x2="226" y2="216"/>
+    </g>
+  </g>
+
+  <g font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="326" y="168" font-size="88" font-weight="800" letter-spacing="-2" fill="#f2f4fb">bot<tspan fill="url(#accent)">wright</tspan></text>
+    <text x="330" y="210" font-size="24" fill="#8b95b5">Event-driven bots for Rust</text>
+  </g>
+
+  <g id="pipeline" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" text-anchor="middle">
+    <line x1="330" y1="262" x2="784" y2="262" stroke="#2a3350" stroke-width="2"/>
+    <g fill="#5eead4">
+      <circle r="4"><animateMotion path="M394,262 H724" dur="3s" begin="0s" repeatCount="indefinite"/></circle>
+      <circle r="4"><animateMotion path="M394,262 H724" dur="3s" begin="1s" repeatCount="indefinite"/></circle>
+      <circle r="4"><animateMotion path="M394,262 H724" dur="3s" begin="2s" repeatCount="indefinite"/></circle>
+    </g>
+    <rect x="330" y="244" width="128" height="36" rx="18" fill="#121830" stroke="#3b4670" stroke-width="2"/>
+    <rect x="502" y="244" width="118" height="36" rx="18" fill="#121830" stroke="#ff8a3a" stroke-width="2"/>
+    <rect x="664" y="244" width="120" height="36" rx="18" fill="#121830" stroke="#3b4670" stroke-width="2"/>
+    <text x="394" y="267" fill="#c9d1ea">collector</text>
+    <text x="561" y="267" fill="#ffc35a">strategy</text>
+    <text x="724" y="267" fill="#c9d1ea">executor</text>
+  </g>
+
+  <g id="chain" stroke-width="2">
+    <g stroke="#3b4670">
+      <line x1="940" y1="130" x2="964" y2="130"/>
+      <line x1="1004" y1="130" x2="1028" y2="130"/>
+      <line x1="1068" y1="130" x2="1092" y2="130"/>
+      <line x1="1132" y1="130" x2="1156" y2="130"/>
+    </g>
+    <path d="M1048,150 V190 H1092" fill="none" stroke="#3b4670" stroke-dasharray="4 5"/>
+    <g fill="#121830" stroke="#3b4670">
+      <rect x="900" y="110" width="40" height="40" rx="8"/>
+      <rect x="964" y="110" width="40" height="40" rx="8"/>
+      <rect x="1028" y="110" width="40" height="40" rx="8"/>
+      <rect x="1092" y="110" width="40" height="40" rx="8"/>
+    </g>
+    <rect x="1156" y="110" width="40" height="40" rx="8" fill="#121830" stroke="url(#accent)">
+      <animate attributeName="opacity" values="0.4;1;0.4" dur="2.4s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="1092" y="170" width="40" height="40" rx="8" fill="none" stroke="#5a6488" stroke-dasharray="4 5" opacity="0.7"/>
+    <g fill="#5eead4" stroke="none">
+      <circle cx="920" cy="130" r="3"/>
+      <circle cx="984" cy="130" r="3"/>
+      <circle cx="1048" cy="130" r="3"/>
+      <circle cx="1112" cy="130" r="3"/>
+      <circle cx="1176" cy="130" r="3"/>
+    </g>
+    <text x="1112" y="236" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" text-anchor="middle" fill="#5a6488" stroke="none">reorg</text>
+  </g>
+</svg>
