@@ -19,6 +19,7 @@ struct Burst {
     n: u64,
     spacing: Option<Duration>,
     last: Arc<AtomicU64>,
+    connected_at: Arc<Mutex<Option<Instant>>>,
     done_at: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -29,6 +30,7 @@ impl Burst {
             n,
             spacing: None,
             last: Arc::default(),
+            connected_at: Arc::default(),
             done_at: Arc::default(),
         }
     }
@@ -36,6 +38,10 @@ impl Burst {
     fn spaced(mut self, spacing: Duration) -> Self {
         self.spacing = Some(spacing);
         self
+    }
+
+    fn connected_at(&self) -> Option<Instant> {
+        *self.connected_at.lock().unwrap()
     }
 
     fn done_at(&self) -> Option<Instant> {
@@ -57,6 +63,10 @@ impl Collector<u64> for Burst {
         impl TryStream<Ok = Item<u64, u64>, Error = CollectorError> + Send + 'static,
         CollectorError,
     > {
+        self.connected_at
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
         let this = self.clone();
         Ok(stream::unfold(resume.unwrap_or(0), move |i| {
             let this = this.clone();
@@ -262,7 +272,6 @@ fn dropping_does_not_slow_others(delivery: Delivery) {
     let slow = Log::default();
     let fast = Log::default();
     let fast_done = Arc::new(Mutex::new(None));
-    let started = Instant::now();
     let report = Harness::new(
         builder()
             .collector(burst.clone(), CollectorOpts::default())
@@ -289,6 +298,7 @@ fn dropping_does_not_slow_others(delivery: Delivery) {
     .run();
     assert!(report.completed);
 
+    let started = burst.connected_at().expect("collector connected");
     let collector_time = burst.done_at().expect("collector finished") - started;
     let fast_time = fast_done.lock().unwrap().expect("fast strategy finished") - started;
     assert!(
