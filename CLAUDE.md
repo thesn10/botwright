@@ -40,7 +40,16 @@ cargo +1.90 check --all-targets --features $E                                   
   - `ProviderSource::ws` opens WebSocket connections with alloy's auto-reconnect disabled (it would silently lose events).
   - `TransactionExecutor` fills and signs via a FillProvider (`CachedNonceManager`), broadcasts the raw tx to all endpoints and reports `TxFeedback` through a `ChannelCollector`.
 
-## Conventions
+## Code rules
 
-- `#![deny(missing_docs)]`, `unsafe_code = "forbid"`. No inline comments except a one-line non-obvious "why". Rustdoc stays short.
+- Rust uses iterator pipelines instead of `for`/`while` loops; itertools is available. Solidity may use loops.
+  - Loop fission: every stage of a pipeline does one thing. A closure longer than a few lines becomes a named function.
+  - No hidden mutation: no `scan` state, no captured `mut` accumulators, no `for_each` with a body. `for_each` only ends a pipeline with a single call.
+  - Results are returned as values, not written through `&mut` into a shared record; assemble records in one place.
+- Separate the steps of a function with blank lines, one paragraph per step.
+- Name data instead of using tuples: no tuple with more than two fields, and no nested tuples, across a function boundary.
+- Every module starts with a short `//!` doc: what it does and where it sits in the data flow. Split a file into submodules by responsibility once it passes about 400 lines.
+- Comments carry what the code cannot say: protocol and economic facts, units, invariants, a non-obvious *why*. One line each, never a restatement of the code. This replaces the stricter global comment rule for this project.
+- Wrap `sol!` blocks that make clippy report `too_many_arguments` in `mod abi { #![allow(clippy::too_many_arguments)] … } pub use abi::*;`.
+- Secrets come only from env (`${VAR}` in the TOML) and keystore files (`keys/`, gitignored).
 - Don't name thiserror fields `source` (use `source_name`).

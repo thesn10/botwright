@@ -16,7 +16,7 @@ use botwright::{
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 
 const EMITTER_INIT: &str = "600e600c600039600e6000f3600035600052600160206000a100";
@@ -316,6 +316,32 @@ impl Strategy<Ev, ()> for Recorder {
     ) -> Result<(), BoxError> {
         self.0.0.lock().unwrap().push(Seen::System(event.clone()));
         Ok(())
+    }
+}
+
+/// A [`Recorder`] that handles each event only after taking a permit, so a test can stall it.
+pub struct Gated(pub Recorder, pub Arc<Semaphore>);
+
+impl Strategy<Ev, ()> for Gated {
+    fn name(&self) -> &str {
+        "gated"
+    }
+
+    async fn on_event(
+        &mut self,
+        event: &Envelope<Ev>,
+        ctx: &mut StrategyCtx<()>,
+    ) -> Result<(), BoxError> {
+        self.1.acquire().await?.forget();
+        self.0.on_event(event, ctx).await
+    }
+
+    async fn on_system(
+        &mut self,
+        event: &SystemEvent,
+        ctx: &mut StrategyCtx<()>,
+    ) -> Result<(), BoxError> {
+        self.0.on_system(event, ctx).await
     }
 }
 

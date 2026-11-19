@@ -1,15 +1,22 @@
+//! [`LogCollector`]: logs from a subscription, gaps from a [`LogBackfill`] page by page, and
+//! removals for blocks that left the canonical chain.
+
 use std::collections::{BTreeMap, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
+use std::future::{self, Future};
+use std::iter;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex};
 
-use futures::{Stream, StreamExt, TryStream, stream};
+use futures::{Stream, StreamExt, TryStream, TryStreamExt, stream};
+use itertools::Itertools;
+use tokio::sync::broadcast::error::RecvError;
 
 use super::alloy::consensus::BlockHeader;
 use super::alloy::network::primitives::HeaderResponse;
 use super::alloy::network::{Ethereum, Network};
 use super::alloy::primitives::B256;
 use super::alloy::providers::{DynProvider, Provider};
+use super::alloy::pubsub::Subscription;
 use super::alloy::rpc::types::{Filter, Log};
 use super::follower::{ChainItem, ChainOpts, Follower, Recent};
 use super::{ChainEvent, ProviderSource, transport};
@@ -65,6 +72,21 @@ pub trait LogBackfill<N: Network = Ethereum>: Send + Sync + 'static {
         from: u64,
         to: u64,
     ) -> impl Future<Output = Result<Vec<Log>, CollectorError>> + Send;
+
+    /// The logs of `from..=to` as consecutive pages, each ordered by block and log index.
+    ///
+    /// [`LogCollector`] pulls the next page only after the previous one was delivered, so a large
+    /// gap is never held in memory at once. The default is a single page from
+    /// [`backfill`](Self::backfill).
+    fn pages(
+        self: Arc<Self>,
+        provider: DynProvider<N>,
+        filter: Filter,
+        from: u64,
+        to: u64,
+    ) -> impl Stream<Item = Result<Vec<Log>, CollectorError>> + Send + 'static {
+        stream::once(async move { self.backfill(&provider, &filter, from, to).await })
+    }
 }
 
 /// Backfills with `eth_getLogs` in ranges of at most `max_range` blocks, halving the range when
@@ -90,6 +112,64 @@ impl Default for RpcBackfill {
     }
 }
 
+struct RpcPages<N: Network> {
+    provider: DynProvider<N>,
+    filter: Filter,
+    start: u64,
+    to: u64,
+    range: u64,
+}
+
+struct Attempt {
+    range: u64,
+    end: u64,
+    logs: Result<Vec<Log>, CollectorError>,
+}
+
+impl<N: Network> RpcPages<N> {
+    async fn next(self) -> Result<Option<(Vec<Log>, Self)>, CollectorError> {
+        if self.start > self.to {
+            return Ok(None);
+        }
+
+        let ranges = iter::successors(Some(self.range), |range| (*range > 1).then_some(range / 2));
+        let attempts = stream::iter(ranges)
+            .then(|range| self.fetch(range))
+            .skip_while(|attempt| future::ready(attempt.logs.is_err() && attempt.range > 1));
+        let attempt = pin!(attempts)
+            .next()
+            .await
+            .expect("a range of one block is always tried");
+
+        let logs = attempt.logs?;
+        let rest = Self {
+            start: attempt.end + 1,
+            range: attempt.range,
+            ..self
+        };
+        Ok(Some((logs, rest)))
+    }
+
+    fn fetch(&self, range: u64) -> impl Future<Output = Attempt> + Send + use<N> {
+        let end = self.to.min(self.start.saturating_add(range - 1));
+        let filter = self.filter.clone().from_block(self.start).to_block(end);
+        let provider = self.provider.clone();
+        async move {
+            let logs = provider
+                .get_logs(&filter)
+                .await
+                .inspect_err(|err| tracing::debug!(error = %err, range, "eth_getLogs failed"))
+                .map(|logs| {
+                    logs.into_iter()
+                        .sorted_by_key(|log| (log.block_number, log.log_index))
+                        .collect()
+                })
+                .map_err(transport);
+            Attempt { range, end, logs }
+        }
+    }
+}
+
 impl<N: Network> LogBackfill<N> for RpcBackfill {
     async fn backfill(
         &self,
@@ -98,33 +178,37 @@ impl<N: Network> LogBackfill<N> for RpcBackfill {
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>, CollectorError> {
-        let mut logs = Vec::new();
-        let mut range = self.max_range;
-        let mut start = from;
-        while start <= to {
-            let end = to.min(start.saturating_add(range - 1));
-            match provider
-                .get_logs(&filter.clone().from_block(start).to_block(end))
-                .await
-            {
-                Ok(mut chunk) => {
-                    logs.append(&mut chunk);
-                    start = end + 1;
-                }
-                Err(err) if range > 1 => {
-                    range /= 2;
-                    tracing::debug!(error = %err, range, "eth_getLogs failed, shrinking range");
-                }
-                Err(err) => return Err(transport(err)),
-            }
-        }
-        logs.sort_by_key(|log| (log.block_number, log.log_index));
-        Ok(logs)
+        Arc::new(*self)
+            .pages(provider.clone(), filter.clone(), from, to)
+            .try_concat()
+            .await
+    }
+
+    fn pages(
+        self: Arc<Self>,
+        provider: DynProvider<N>,
+        filter: Filter,
+        from: u64,
+        to: u64,
+    ) -> impl Stream<Item = Result<Vec<Log>, CollectorError>> + Send + 'static {
+        let pages = RpcPages {
+            provider,
+            filter,
+            start: from,
+            to,
+            range: self.max_range,
+        };
+        stream::try_unfold(pages, RpcPages::next)
     }
 }
 
 /// Subscribes to logs and, after a reconnect, backfills everything since the last cursor with a
 /// [`LogBackfill`], dropping duplicates.
+///
+/// The backfill arrives page by page; the next page is fetched only after the previous one was
+/// delivered. Before [`GapFilled`](Item::GapFilled) it backfills again up to the new head. When the
+/// subscription buffer overflows while the strategy is busy, it backfills from the last delivered
+/// block the same way.
 ///
 /// Alongside the logs it follows the canonical chain like a [`BlockCollector`](super::BlockCollector).
 /// When a block with delivered logs leaves the canonical chain, its logs arrive again as
@@ -222,23 +306,31 @@ impl Delivered {
     }
 }
 
-type LogStream = Pin<Box<dyn Stream<Item = Log> + Send>>;
+type LiveStream = Pin<Box<dyn Stream<Item = Live> + Send>>;
+type PageStream = Pin<Box<dyn Stream<Item = Result<Vec<Log>, CollectorError>> + Send>>;
 type HeadItems<H> = Pin<Box<dyn Stream<Item = Result<ChainItem<H>, CollectorError>> + Send>>;
+
+enum Live {
+    Log(Box<Log>),
+    Lagged(u64),
+}
 
 struct Gap {
     from: u64,
     to: u64,
+    pages: PageStream,
 }
 
 struct LogState<N: Network, B> {
     provider: DynProvider<N>,
-    live: LogStream,
+    live: LiveStream,
     heads: HeadItems<N::HeaderResponse>,
     filter: Filter,
     backfill: Arc<B>,
     depth: u64,
     delivered: Arc<Mutex<Delivered>>,
     gap: Option<Gap>,
+    floor: u64,
     repair_from: Option<u64>,
     queued: VecDeque<Item<LogEvent, LogCursor>>,
     last: Option<LogCursor>,
@@ -250,13 +342,11 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
             if let Some(item) = self.queued.pop_front() {
                 return Ok(Some(item));
             }
-            if let Some(Gap { from, to }) = self.gap.take() {
-                let logs = self
-                    .backfill
-                    .backfill(&self.provider, &self.filter, from, to)
-                    .await?;
-                logs.into_iter().for_each(|log| self.added(log));
-                self.queued.push_back(Item::GapFilled { from, to });
+            if let Some(gap) = self.gap.as_mut() {
+                match gap.pages.try_next().await? {
+                    Some(page) => page.into_iter().for_each(|log| self.added(log)),
+                    None => self.close_gap().await?,
+                }
                 continue;
             }
             if let Some(from) = self.repair_from.take() {
@@ -269,13 +359,56 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                     Some(item) => self.on_chain(item?).await?,
                     None => return Ok(None),
                 },
-                log = self.live.next() => match log {
-                    Some(log) if log.removed => self.removed(&log),
-                    Some(log) => self.added(log),
+                live = self.live.next() => match live {
+                    Some(Live::Log(log)) if log.removed => self.removed(&log),
+                    Some(Live::Log(log)) => self.added(*log),
+                    Some(Live::Lagged(missed)) => self.refill(missed).await?,
                     None => return Ok(None),
                 },
             }
         }
+    }
+
+    fn pages(&self, from: u64, to: u64) -> PageStream {
+        Box::pin(Arc::clone(&self.backfill).pages(
+            self.provider.clone(),
+            self.filter.clone(),
+            from,
+            to,
+        ))
+    }
+
+    fn open_gap(&mut self, from: u64, to: u64) {
+        let pages = self.pages(from, to);
+        self.gap = Some(Gap { from, to, pages });
+    }
+
+    async fn close_gap(&mut self) -> Result<(), CollectorError> {
+        let Some(mut gap) = self.gap.take() else {
+            return Ok(());
+        };
+        let head = self.provider.get_block_number().await.map_err(transport)?;
+        if head > gap.to {
+            gap.pages = self.pages(gap.to + 1, head);
+            gap.to = head;
+            self.gap = Some(gap);
+        } else {
+            self.queued.push_back(Item::GapFilled {
+                from: gap.from,
+                to: gap.to,
+            });
+        }
+        Ok(())
+    }
+
+    async fn refill(&mut self, missed: u64) -> Result<(), CollectorError> {
+        let from = self.last.map_or(self.floor, |last| last.block);
+        let head = self.provider.get_block_number().await.map_err(transport)?;
+        tracing::info!(missed, from, head, "log subscription lagged, backfilling");
+        if head >= from {
+            self.open_gap(from, head);
+        }
+        Ok(())
     }
 
     async fn on_chain(&mut self, item: ChainItem<N::HeaderResponse>) -> Result<(), CollectorError> {
@@ -446,6 +579,14 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
     }
 }
 
+async fn next_live(mut subscription: Subscription<Log>) -> Option<(Live, Subscription<Log>)> {
+    match subscription.recv().await {
+        Ok(log) => Some((Live::Log(Box::new(log)), subscription)),
+        Err(RecvError::Lagged(missed)) => Some((Live::Lagged(missed), subscription)),
+        Err(RecvError::Closed) => None,
+    }
+}
+
 impl<N, B, E> Collector<E> for LogCollector<N, B>
 where
     N: Network,
@@ -478,27 +619,26 @@ where
             .subscribe_logs(&self.filter)
             .await
             .map_err(transport)?;
+        let live = stream::unfold(subscription, next_live);
+        let head = provider.get_block_number().await.map_err(transport)?;
         let from = resume.map(|c| c.block).or(self.start_block);
-        let gap = match from {
-            Some(from) => {
-                let head = provider.get_block_number().await.map_err(transport)?;
-                (head >= from).then_some(Gap { from, to: head })
-            }
-            None => None,
-        };
-        let state = LogState {
+        let mut state = LogState {
             provider,
-            live: Box::pin(subscription.into_stream()),
+            live: Box::pin(live),
             heads: Box::pin(follower.into_stream()),
             filter: self.filter.clone(),
             backfill: Arc::clone(&self.backfill),
             depth: self.chain.max_reorg_depth,
             delivered: Arc::clone(&self.delivered),
-            gap,
+            gap: None,
+            floor: from.unwrap_or(head),
             repair_from: None,
             queued: VecDeque::new(),
             last: resume,
         };
+        if let Some(from) = from.filter(|from| head >= *from) {
+            state.open_gap(from, head);
+        }
         Ok(stream::try_unfold(state, |mut state| async move {
             let item = state.next_item().await?;
             Ok(item.map(|item| (item.map_event(E::from), state)))
@@ -512,6 +652,7 @@ mod tests {
     use super::super::alloy::providers::ProviderBuilder;
     use super::super::alloy::transports::mock::Asserter;
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn log(block: u64, hash: u8, value: u8, removed: bool) -> Log {
         Log {
@@ -528,20 +669,106 @@ mod tests {
     }
 
     fn state(live: Vec<Log>, node: &Asserter) -> LogState<Ethereum, RpcBackfill> {
+        let live = live.into_iter().map(Box::new).map(Live::Log).collect();
+        state_with(live, node, RpcBackfill::default())
+    }
+
+    fn state_with<B>(live: Vec<Live>, node: &Asserter, backfill: B) -> LogState<Ethereum, B> {
         let provider = ProviderBuilder::new().connect_mocked_client(node.clone());
         LogState {
             provider: DynProvider::new(provider),
             live: Box::pin(stream::iter(live)),
             heads: Box::pin(stream::pending()),
             filter: Filter::new(),
-            backfill: Arc::new(RpcBackfill::default()),
+            backfill: Arc::new(backfill),
             depth: 64,
             delivered: Arc::default(),
             gap: None,
+            floor: 0,
             repair_from: None,
             queued: VecDeque::new(),
             last: None,
         }
+    }
+
+    #[derive(Default)]
+    struct Scripted {
+        responses: Mutex<VecDeque<Vec<Vec<Log>>>>,
+        requests: Mutex<Vec<(u64, u64)>>,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    impl Scripted {
+        fn new(responses: Vec<Vec<Vec<Log>>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl LogBackfill for Scripted {
+        async fn backfill(
+            &self,
+            _: &DynProvider,
+            _: &Filter,
+            _: u64,
+            _: u64,
+        ) -> Result<Vec<Log>, CollectorError> {
+            unreachable!("the collector pages")
+        }
+
+        fn pages(
+            self: Arc<Self>,
+            _: DynProvider,
+            _: Filter,
+            from: u64,
+            to: u64,
+        ) -> impl Stream<Item = Result<Vec<Log>, CollectorError>> + Send + 'static {
+            self.requests.lock().unwrap().push((from, to));
+            let pages = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            let pulled = Arc::clone(&self.pulled);
+            stream::iter(pages).map(move |page| {
+                pulled.fetch_add(1, Ordering::SeqCst);
+                Ok(page)
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Added(u8),
+        Removed(u8),
+        Filled(u64, u64),
+    }
+
+    fn step(item: Item<LogEvent, LogCursor>) -> Step {
+        match item {
+            Item::Event {
+                event: LogEvent::Added(log),
+                ..
+            } => Step::Added(log.inner.data.data[0]),
+            Item::Event {
+                event: LogEvent::Removed(log),
+                ..
+            } => Step::Removed(log.inner.data.data[0]),
+            Item::GapFilled { from, to } => Step::Filled(from, to),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn steps<B: LogBackfill>(state: &mut LogState<Ethereum, B>) -> Vec<Step> {
+        stream::unfold(state, |state| async move {
+            let item = state.next_item().await.unwrap()?;
+            Some((step(item), state))
+        })
+        .collect()
+        .await
     }
 
     fn canonical(node: &Asserter, head: u64, logs: Vec<Log>) {
@@ -622,6 +849,114 @@ mod tests {
                 (true, 5)
             ]
         );
+        assert!(node.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gap_pages_arrive_in_order_and_catch_up_to_the_head() {
+        let node = Asserter::new();
+        node.push_success(&U64::from(5));
+        node.push_success(&U64::from(5));
+        let backfill = Scripted::new(vec![
+            vec![
+                vec![log(1, 0xa, 1, false)],
+                vec![log(2, 0xb, 2, false), log(3, 0xc, 3, false)],
+            ],
+            vec![vec![log(4, 0xd, 4, false)]],
+        ]);
+        let mut state = state_with(Vec::new(), &node, backfill);
+        state.open_gap(1, 3);
+
+        assert_eq!(
+            steps(&mut state).await,
+            vec![
+                Step::Added(1),
+                Step::Added(2),
+                Step::Added(3),
+                Step::Added(4),
+                Step::Filled(1, 5)
+            ]
+        );
+        assert_eq!(
+            *state.backfill.requests.lock().unwrap(),
+            vec![(1, 3), (4, 5)]
+        );
+        assert!(node.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn next_page_is_fetched_after_the_previous_one_was_delivered() {
+        let node = Asserter::new();
+        node.push_success(&U64::from(2));
+        let backfill = Scripted::new(vec![vec![
+            vec![log(1, 0xa, 1, false)],
+            vec![log(2, 0xb, 2, false)],
+        ]]);
+        let mut state = state_with(Vec::new(), &node, backfill);
+        state.open_gap(1, 2);
+
+        let first = state.next_item().await.unwrap();
+        assert!(matches!(
+            first,
+            Some(Item::Event {
+                event: LogEvent::Added(_),
+                ..
+            })
+        ));
+        assert_eq!(state.backfill.pulled.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            steps(&mut state).await,
+            vec![Step::Added(2), Step::Filled(1, 2)]
+        );
+        assert_eq!(state.backfill.pulled.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn lagged_subscription_backfills_from_the_last_delivered_block() {
+        let node = Asserter::new();
+        node.push_success(&U64::from(6));
+        node.push_success(&U64::from(6));
+        let backfill = Scripted::new(vec![vec![vec![
+            log(4, 0xa, 3, false),
+            log(5, 0xb, 4, false),
+            log(6, 0xc, 5, false),
+        ]]]);
+        let live = vec![
+            Live::Log(Box::new(log(4, 0xa, 3, false))),
+            Live::Lagged(7),
+            Live::Log(Box::new(log(6, 0xc, 5, false))),
+        ];
+        let mut state = state_with(live, &node, backfill);
+
+        assert_eq!(
+            steps(&mut state).await,
+            vec![
+                Step::Added(3),
+                Step::Added(4),
+                Step::Added(5),
+                Step::Filled(4, 6)
+            ]
+        );
+        assert_eq!(*state.backfill.requests.lock().unwrap(), vec![(4, 6)]);
+        assert!(node.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_pages_halve_the_range_after_a_rejected_request() {
+        let node = Asserter::new();
+        node.push_failure_msg("range too large");
+        node.push_success(&vec![log(1, 0xa, 1, false)]);
+        node.push_success(&vec![log(4, 0xb, 2, false)]);
+        node.push_success(&Vec::<Log>::new());
+        let provider = DynProvider::new(ProviderBuilder::new().connect_mocked_client(node.clone()));
+
+        let pages: Vec<Vec<Log>> = Arc::new(RpcBackfill::new(4))
+            .pages(provider, Filter::new(), 1, 6)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(pages.iter().map(Vec::len).collect_vec(), vec![1, 1, 0]);
         assert!(node.read_q().is_empty());
     }
 }

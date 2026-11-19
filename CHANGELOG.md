@@ -7,6 +7,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `LogBackfill::pages` delivers a gap as a stream of pages; the default wraps `backfill` in one page.
+  `RpcBackfill` yields one `eth_getLogs` range per page, `HyperSyncBackfill` one HyperSync response.
+- `HyperSyncBackfill::stream_config` sets concurrency and look-ahead of the HyperSync stream.
+
+### Changed
+
+- `LogCollector` delivers a backfill page by page with backpressure instead of loading the whole gap
+  into memory first, and backfills again up to the new head before it reports `GapFilled`.
+- `HyperSyncBackfill` fetches pages ahead in parallel through `hypersync_client::Client::stream`,
+  falls back to `eth_getLogs` only above HyperSync's archive height, and fills `block_timestamp`.
+
+### Fixed
+
+- `LogCollector` lost logs when the strategy applied backpressure for longer than the node's
+  subscription buffer (16 entries by default) lasted, for example during a large backfill: alloy
+  dropped the oldest entries silently. A lagging subscription now triggers a backfill from the last
+  delivered block.
+
 ## [0.1.1] - 2026-11-19
 
 ### Fixed

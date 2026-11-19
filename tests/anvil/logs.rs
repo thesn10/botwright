@@ -1,12 +1,14 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
 
 use botwright::eth::{BlockCollector, BlockCursor, Filter, LogCollector, Provider};
 use botwright::{Delivery, Engine, SystemEvent};
+use tokio::sync::Semaphore;
 
 use crate::harness::{
-    Ev, Proxy, Record, Recorder, anvil, deploy_emitter, emit, opts, spawn, stop, until,
+    Ev, Gated, Proxy, Record, Recorder, anvil, deploy_emitter, emit, opts, spawn, stop, until,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -62,6 +64,38 @@ async fn log_gap_is_backfilled_exactly_once() {
         "{:?}",
         record.systems()
     );
+    stop(handle, run).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_missed_by_a_lagging_subscription_are_backfilled() {
+    let Some(anvil) = anvil().await else { return };
+    let provider = anvil.provider().await;
+    let (from, emitter) = deploy_emitter(&provider).await;
+    let ws = format!("ws://127.0.0.1:{}", anvil.port);
+
+    let record = Record::default();
+    let gate = Arc::new(Semaphore::new(0));
+    let logs = LogCollector::ws("logs", ws, Filter::new().address(emitter));
+    let engine = Engine::<Ev, ()>::builder()
+        .collector(logs, opts())
+        .strategy(Gated(Recorder(record.clone()), Arc::clone(&gate)), |s| {
+            s.from("logs", Delivery::Lossless { capacity: 1 })
+        })
+        .build()
+        .unwrap();
+    let (handle, run) = spawn(engine);
+
+    until("connect", || record.connects("logs") == 1).await;
+    stream::iter(1..=40)
+        .for_each(|v| emit(&provider, from, emitter, v))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    gate.add_permits(Semaphore::MAX_PERMITS / 2);
+    until("all logs", || record.added().len() >= 40).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(record.added(), (1..=40).collect::<Vec<_>>());
     stop(handle, run).await;
 }
 

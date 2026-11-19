@@ -41,7 +41,7 @@ Each subscription picks a `Delivery`:
 |---|---|
 | `CollectorConnected { source }` | the stream is (again) established |
 | `CollectorDisconnected { source, error }` | the stream broke; a reconnect with backoff is running |
-| `GapFilled { source, from, to }` | the gap after a break was backfilled completely |
+| `GapFilled { source, from, to }` | the gap after a break (or, for `LogCollector`, a lagging subscription) was backfilled completely; `to` is the head when it was reported |
 | `GapUnfilled { source, from, to }` | the gap cannot be backfilled; rebuild state |
 | `Lagging { source, depth }` | the channel is over the lagging threshold |
 | `Dropped { source, count }` | events were dropped (`DropOldest`, `DropNewest`) |
@@ -58,7 +58,7 @@ Each subscription picks a `Delivery`:
 ## EVM collectors
 
 - `BlockCollector` delivers canonical blocks in chain order. Missing headers after a break are fetched up to `max_backfill` (default 1000); beyond that, `GapUnfilled` is reported. Reorgs are detected via `parent_hash` up to `max_reorg_depth` (default 64) and reported as `ChainEvent::Reorg { common_ancestor, dropped }` followed by the new canonical blocks.
-- `LogCollector` subscribes to logs and, after a break, backfills from the last delivered log with `eth_getLogs` (or `HyperSyncBackfill`). Every log is delivered exactly once. It also follows the canonical chain: when a block whose logs were delivered leaves the chain, those logs arrive again as `LogEvent::Removed` (newest first), followed by the logs of the new chain as `LogEvent::Added`. Removals the node reports itself (`removed: true`) are deduplicated with this.
+- `LogCollector` subscribes to logs and, after a break, backfills from the last delivered log with `eth_getLogs` (or `HyperSyncBackfill`). The gap arrives page by page: the next page is fetched only after the previous one was delivered, so a `Lossless` subscription holds back the backfill instead of buffering it. Before `GapFilled` it backfills again up to the new head until no blocks are left. When the node's subscription buffer overflows (alloy drops the oldest entries), it backfills from the last delivered block the same way. Every log is delivered exactly once. It also follows the canonical chain: when a block whose logs were delivered leaves the chain, those logs arrive again as `LogEvent::Removed` (newest first), followed by the logs of the new chain as `LogEvent::Added`. Removals the node reports itself (`removed: true`) are deduplicated with this.
 - `LogsInBlockCollector` and `FullBlockCollector` inherit gap and reorg handling from `BlockCollector`.
 - Use `ProviderSource::ws` (the `ws` constructors) rather than a shared WebSocket provider with alloy's automatic reconnect: the automatic reconnect resubscribes silently, so events from the outage are lost without the collector noticing.
 
