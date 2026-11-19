@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::{StreamExt, stream};
+
 use botwright::eth::{
     Address, B256, BlockCursor, Bytes, ChainEvent, DynProvider, Header, LogEvent, Provider,
     ProviderBuilder, TransactionRequest, U256,
@@ -57,16 +59,20 @@ pub async fn anvil() -> Option<Anvil> {
             return None;
         }
     };
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            return Some(Anvil {
-                _child: child,
-                port,
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("anvil did not start");
+    let up = stream::iter(0..100)
+        .any(|_| async move {
+            let up = TcpStream::connect(("127.0.0.1", port)).await.is_ok();
+            if !up {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            up
+        })
+        .await;
+    assert!(up, "anvil did not start");
+    Some(Anvil {
+        _child: child,
+        port,
+    })
 }
 
 impl Anvil {
@@ -314,13 +320,18 @@ impl Strategy<Ev, ()> for Recorder {
 }
 
 pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
-    for _ in 0..400 {
-        if condition() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for {what}");
+    let met = stream::iter(0..400)
+        .any(|_| {
+            let met = condition();
+            async move {
+                if !met {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                met
+            }
+        })
+        .await;
+    assert!(met, "timed out waiting for {what}");
 }
 
 pub fn opts() -> CollectorOpts {

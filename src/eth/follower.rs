@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, future, stream};
 use tokio::time::MissedTickBehavior;
 
 use super::alloy::consensus::BlockHeader;
@@ -183,9 +183,8 @@ impl<N: Network> Follower<N> {
         {
             let mut recent = self.recent.lock().expect("lock");
             recent.push_back(cursor);
-            while recent.len() as u64 > self.opts.max_reorg_depth + 1 {
-                recent.pop_front();
-            }
+            let excess = (recent.len() as u64).saturating_sub(self.opts.max_reorg_depth + 1);
+            recent.drain(..excess as usize);
         }
         self.pending
             .push_back(Item::new(ChainEvent::Block(header), cursor));
@@ -216,10 +215,13 @@ impl<N: Network> Follower<N> {
                     continue;
                 }
                 work.push_front(header);
-                for n in (tip.number + 1..number).rev() {
-                    let fetched = header_by_number(&self.provider, n).await?;
-                    work.push_front(fetched);
-                }
+                stream::iter((tip.number + 1..number).rev())
+                    .then(|n| header_by_number(&self.provider, n))
+                    .try_for_each(|fetched| {
+                        work.push_front(fetched);
+                        future::ok(())
+                    })
+                    .await?;
             } else {
                 self.reorg(header).await?;
             }
@@ -263,9 +265,10 @@ impl<N: Network> Follower<N> {
                 from: oldest,
                 to: tip_number,
             });
-            for header in new_chain.into_iter().rev() {
-                self.append(header);
-            }
+            new_chain
+                .into_iter()
+                .rev()
+                .for_each(|header| self.append(header));
             return Ok(());
         };
         let dropped: Vec<BlockCursor> = {
@@ -285,9 +288,10 @@ impl<N: Network> Follower<N> {
             },
             ancestor,
         ));
-        for header in new_chain.into_iter().rev() {
-            self.append(header);
-        }
+        new_chain
+            .into_iter()
+            .rev()
+            .for_each(|header| self.append(header));
         Ok(())
     }
 }

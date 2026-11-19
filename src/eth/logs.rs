@@ -255,9 +255,7 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                     .backfill
                     .backfill(&self.provider, &self.filter, from, to)
                     .await?;
-                for log in logs {
-                    self.added(log);
-                }
+                logs.into_iter().for_each(|log| self.added(log));
                 self.queued.push_back(Item::GapFilled { from, to });
                 continue;
             }
@@ -307,9 +305,10 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                     },
                 ..
             } => {
-                for block in dropped.iter().rev() {
-                    self.remove_block(block.number, Some(block.hash));
-                }
+                dropped
+                    .iter()
+                    .rev()
+                    .for_each(|block| self.remove_block(block.number, Some(block.hash)));
                 self.schedule_repair(common_ancestor.number + 1);
             }
             Item::GapFilled { .. } | Item::GapUnfilled { .. } => {}
@@ -325,9 +324,7 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
         let logs = RpcBackfill::default()
             .backfill(&self.provider, &self.filter, from, head)
             .await?;
-        for log in logs {
-            self.added(log);
-        }
+        logs.into_iter().for_each(|log| self.added(log));
         Ok(())
     }
 
@@ -354,13 +351,14 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
         if self.last.is_some_and(|last| last.block >= number) {
             self.last = rewound;
         }
-        for mut log in logs.into_iter().rev() {
+        let cursor = self.last;
+        self.queued.extend(logs.into_iter().rev().map(|mut log| {
             log.removed = true;
-            self.queued.push_back(Item::Event {
+            Item::Event {
                 event: LogEvent::Removed(log),
-                cursor: self.last,
-            });
-        }
+                cursor,
+            }
+        }));
     }
 
     fn added(&mut self, log: Log) {
@@ -440,9 +438,9 @@ impl<N: Network, B: LogBackfill<N>> LogState<N, B> {
                 .map(|(n, _)| *n)
                 .collect()
         };
-        for block in descendants {
-            self.remove_block(block, None);
-        }
+        descendants
+            .into_iter()
+            .for_each(|block| self.remove_block(block, None));
         self.remove_block(number, hash);
         self.schedule_repair(number);
     }

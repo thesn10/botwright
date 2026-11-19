@@ -147,14 +147,14 @@ impl<E> Subscriptions<E> {
         if let Some(option) = self.misuse {
             return Err(BuildError::MisplacedOption(strategy.to_owned(), option));
         }
-        for sub in &self.subs {
-            if sub.delivery.capacity() == Some(0) {
-                return Err(BuildError::ZeroCapacity {
+        self.subs
+            .iter()
+            .find(|sub| sub.delivery.capacity() == Some(0))
+            .map_or(Ok(()), |sub| {
+                Err(BuildError::ZeroCapacity {
                     strategy: strategy.to_owned(),
                     source_name: sub.source.to_string(),
-                });
-            }
-        }
-        Ok(())
+                })
+            })
     }
 }

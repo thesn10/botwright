@@ -16,16 +16,12 @@ impl NotificationSink for HangingNetwork {
 async fn notify_returns_immediately_and_counts_overflow() {
     let notifier = QueuedNotifier::spawn(HangingNetwork, 10);
     let started = Instant::now();
-    for i in 0..100 {
-        notifier.notify(Notification::warning("lag", format!("event {i}")));
-    }
+    (0..100).for_each(|i| notifier.notify(Notification::warning("lag", format!("event {i}"))));
     assert!(started.elapsed() < Duration::from_millis(50));
     assert_eq!(notifier.dropped(), 90);
 
     tokio::task::yield_now().await;
-    for i in 0..20 {
-        notifier.notify(Notification::warning("lag", format!("again {i}")));
-    }
+    (0..20).for_each(|i| notifier.notify(Notification::warning("lag", format!("again {i}"))));
     assert_eq!(
         notifier.dropped(),
         100,

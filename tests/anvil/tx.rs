@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::{StreamExt, TryStreamExt, stream};
+
 use botwright::eth::{
     Address, PrivateKeySigner, Provider, TransactionAction, TransactionExecutor,
     TransactionRequest, TxFeedback, U256,
@@ -55,9 +57,11 @@ impl Strategy<Event, Pay> for Payer {
     ) -> Result<(), BoxError> {
         match &*event.event {
             Event::Go(n) => {
-                for _ in 0..*n {
-                    ctx.submit(Pay(self.to)).await?;
-                }
+                let (ctx, to) = (&*ctx, self.to);
+                stream::iter(0..*n)
+                    .map(Ok)
+                    .try_for_each(|_| ctx.submit(Pay(to)))
+                    .await?;
             }
             Event::Feedback(f) => self.seen.lock().unwrap().push(f.clone()),
         }

@@ -1,7 +1,6 @@
 //! `/healthz` and `/metrics` over HTTP.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,28 +113,32 @@ pub(crate) async fn serve(opts: HttpOpts, engine: EngineHandle) {
 
 async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, String) {
     let uptime = state.engine.uptime();
-    let mut healthy = !state.engine.is_shutting_down();
-    let mut body = String::new();
-    for c in state.engine.health() {
-        let fresh = state.exempt.contains(&c.name)
-            || match c.last_event_age {
-                Some(age) => age <= state.max_event_age,
-                None => uptime <= state.max_event_age,
-            };
-        let ok = c.finished || (c.connected && fresh);
-        healthy &= ok;
-        let age = c
-            .last_event_age
-            .map_or_else(|| "none".to_owned(), |a| format!("{}ms", a.as_millis()));
-        let _ = writeln!(
-            body,
-            "{} {} connected={} finished={} last_event_age={age}",
-            if ok { "ok" } else { "FAIL" },
-            c.name,
-            c.connected,
-            c.finished,
-        );
-    }
+    let checks: Vec<(bool, String)> = state
+        .engine
+        .health()
+        .into_iter()
+        .map(|c| {
+            let fresh = state.exempt.contains(&c.name)
+                || match c.last_event_age {
+                    Some(age) => age <= state.max_event_age,
+                    None => uptime <= state.max_event_age,
+                };
+            let ok = c.finished || (c.connected && fresh);
+            let age = c
+                .last_event_age
+                .map_or_else(|| "none".to_owned(), |a| format!("{}ms", a.as_millis()));
+            let line = format!(
+                "{} {} connected={} finished={} last_event_age={age}\n",
+                if ok { "ok" } else { "FAIL" },
+                c.name,
+                c.connected,
+                c.finished,
+            );
+            (ok, line)
+        })
+        .collect();
+    let healthy = !state.engine.is_shutting_down() && checks.iter().all(|(ok, _)| *ok);
+    let body = checks.into_iter().map(|(_, line)| line).collect();
     let status = if healthy {
         StatusCode::OK
     } else {

@@ -157,9 +157,10 @@ mod tests {
         let mut state = Backoff::constant(Duration::from_millis(100))
             .jitter(0.5)
             .start();
-        for _ in 0..100 {
-            let d = state.next_delay().unwrap();
-            assert!(d <= Duration::from_millis(100) && d >= Duration::from_millis(50));
-        }
+        assert!(
+            std::iter::repeat_with(|| state.next_delay().unwrap())
+                .take(100)
+                .all(|d| d <= Duration::from_millis(100) && d >= Duration::from_millis(50))
+        );
     }
 }

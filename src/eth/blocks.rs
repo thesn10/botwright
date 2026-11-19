@@ -1,8 +1,9 @@
 use std::fmt;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{TryStream, TryStreamExt};
+use futures::{StreamExt, TryStream, TryStreamExt, future, stream};
 
 use super::alloy::network::primitives::HeaderResponse;
 use super::alloy::network::{Ethereum, Network};
@@ -314,22 +315,24 @@ async fn load_full_block<N: Network>(
     retries: u32,
     delay: Duration,
 ) -> Result<N::BlockResponse, CollectorError> {
-    for attempt in 0..=retries {
-        if let Some(block) = provider
+    let attempts = stream::iter(0..=retries).then(|attempt| async move {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        provider
             .get_block_by_hash(hash)
             .full()
             .await
-            .map_err(transport)?
-        {
-            return Ok(block);
-        }
-        if attempt < retries {
-            tokio::time::sleep(delay).await;
-        }
-    }
-    Err(CollectorError::protocol(format!(
-        "block {hash} not available after {retries} retries"
-    )))
+            .map_err(transport)
+    });
+    pin!(attempts.try_filter_map(future::ok))
+        .try_next()
+        .await?
+        .ok_or_else(|| {
+            CollectorError::protocol(format!(
+                "block {hash} not available after {retries} retries"
+            ))
+        })
 }
 
 /// [`FullBlockCollector`] for HTTP endpoints without subscriptions: polls the latest block.

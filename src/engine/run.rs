@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use futures::{StreamExt, stream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -67,20 +68,13 @@ where
         });
 
         let executors: Vec<JoinHandle<()>> = executor_tasks.into_iter().map(tokio::spawn).collect();
-        let mut strategies = Vec::new();
-        let mut ready = Vec::new();
-        for (task, ready_rx) in strategy_tasks {
-            strategies.push(tokio::spawn(task));
-            ready.push(ready_rx);
-        }
-
-        let mut init_ok = true;
-        for rx in ready {
-            if !rx.await.unwrap_or(false) {
-                init_ok = false;
-                break;
-            }
-        }
+        let (strategies, ready): (Vec<_>, Vec<_>) = strategy_tasks
+            .into_iter()
+            .map(|(task, ready_rx)| (tokio::spawn(task), ready_rx))
+            .unzip();
+        let init_ok = stream::iter(ready)
+            .all(|rx| async { rx.await.unwrap_or(false) })
+            .await;
 
         let mut collectors: Vec<JoinHandle<()>> = Vec::new();
         let reason = if init_ok {
@@ -130,18 +124,20 @@ where
 }
 
 async fn join_until(handles: Vec<JoinHandle<()>>, deadline: Instant, kind: &'static str) {
-    for mut handle in handles {
-        if tokio::time::timeout_at(deadline, &mut handle)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                kind,
-                "task did not stop before the shutdown timeout, aborting"
-            );
-            handle.abort();
-        }
-    }
+    stream::iter(handles)
+        .for_each(|mut handle| async move {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    kind,
+                    "task did not stop before the shutdown timeout, aborting"
+                );
+                handle.abort();
+            }
+        })
+        .await;
 }
 
 #[cfg_attr(not(feature = "signal"), allow(unused_variables))]

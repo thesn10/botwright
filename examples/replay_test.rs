@@ -5,7 +5,6 @@
 //! cargo run --example replay_test --features test-util
 //! ```
 
-use std::io::Write;
 use std::time::Duration;
 
 use botwright::test_util::{Harness, Record, ReplayCollector};
@@ -55,18 +54,21 @@ impl Strategy<Price, Action> for DipBuyer {
 
 fn write_recording(path: &std::path::Path) -> std::io::Result<()> {
     let prices = [100.0, 101.0, 94.0, 95.0, 96.0, 90.0, 91.0];
-    let mut file = std::fs::File::create(path)?;
-    for (i, price) in prices.into_iter().enumerate() {
-        let record = Record {
-            at_ms: i as u64 * 12_000,
-            event: Price {
-                pair: "ETH/USDC".into(),
-                price,
-            },
-        };
-        writeln!(file, "{}", serde_json::to_string(&record)?)?;
-    }
-    Ok(())
+    let lines = prices
+        .into_iter()
+        .enumerate()
+        .map(|(i, price)| {
+            let record = Record {
+                at_ms: i as u64 * 12_000,
+                event: Price {
+                    pair: "ETH/USDC".into(),
+                    price,
+                },
+            };
+            serde_json::to_string(&record).map(|json| json + "\n")
+        })
+        .collect::<Result<String, _>>()?;
+    std::fs::write(path, lines)
 }
 
 fn main() -> Result<(), BoxError> {
@@ -90,8 +92,6 @@ fn main() -> Result<(), BoxError> {
     let second = run()?;
     assert_eq!(first, second, "replay must be deterministic");
     assert_eq!(first.len(), 2);
-    for action in &first {
-        println!("{action}");
-    }
+    first.iter().for_each(|action| println!("{action}"));
     Ok(())
 }

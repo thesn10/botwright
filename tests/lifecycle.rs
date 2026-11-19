@@ -84,9 +84,12 @@ fn reconnects_with_backoff_and_last_cursor() {
     let resumes = scripted.resumes.lock().unwrap().clone();
     let cursors: Vec<_> = resumes.iter().map(|(c, _)| *c).collect();
     assert_eq!(cursors, [None, Some(3), Some(5)]);
-    for pair in resumes.windows(2) {
-        assert!(pair[1].1 - pair[0].1 >= Duration::from_millis(100));
-    }
+    assert!(
+        resumes
+            .windows(2)
+            .all(|pair| pair[1].1 - pair[0].1 >= Duration::from_millis(100)),
+        "{resumes:?}"
+    );
 
     let systems = log.systems();
     let connected = systems

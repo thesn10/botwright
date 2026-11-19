@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use itertools::{Either, Itertools};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use super::builder::StrategyRegistration;
-use super::collector_task::{QueueSink, Sink, SinkKind, StrategyLink};
+use super::collector_task::{Msg, QueueSink, Sink, SinkKind, StrategyLink};
 use super::router::Router;
 use super::signals::Signals;
 use super::strategy_task::{BroadcastRx, StrategyRuntime};
@@ -24,6 +25,19 @@ pub(super) struct CollectorWiring<E> {
     watch: Option<SharedWatch<E>>,
 }
 
+struct Target<'a, E> {
+    name: &'a Arc<str>,
+    signals: &'a Arc<Signals>,
+    lossless: Option<&'a mpsc::Sender<Msg<E>>>,
+    drop_newest: Option<&'a mpsc::Sender<Msg<E>>>,
+    lagging_threshold: f64,
+}
+
+enum SideRx<E> {
+    Broadcast(BroadcastRx<E>),
+    Watch(watch::Receiver<Option<Envelope<E>>>),
+}
+
 impl<E> CollectorWiring<E> {
     pub(super) fn finish(mut self) -> (Vec<Sink<E>>, Vec<StrategyLink<E>>) {
         if let Some((tx, wakers)) = self.broadcast {
@@ -39,6 +53,114 @@ impl<E> CollectorWiring<E> {
             });
         }
         (self.sinks, self.links)
+    }
+
+    fn subscribe(&mut self, sub: &Subscription<E>, target: &Target<'_, E>) -> Option<SideRx<E>> {
+        let slot = target.signals.slot_of(&sub.source);
+        let Subscription {
+            source,
+            delivery,
+            filter,
+            on_full,
+        } = sub;
+        let name = target.name;
+        let labels = [("source", source.as_str()), ("strategy", &**name)];
+        let dropped = || {
+            obs::counter(
+                obs::DROPPED,
+                &[
+                    ("source", source.as_str()),
+                    ("strategy", &**name),
+                    ("delivery", delivery.label()),
+                ],
+            )
+        };
+        match *delivery {
+            Delivery::Lossless { .. } | Delivery::DropNewest { .. } => {
+                let lossless_kind = matches!(delivery, Delivery::Lossless { .. });
+                let channel = if lossless_kind {
+                    target.lossless
+                } else {
+                    target.drop_newest
+                };
+                let tx = channel.expect("channel exists for this delivery").clone();
+                let capacity = tx.max_capacity();
+                let high = ((capacity as f64 * target.lagging_threshold).ceil() as usize)
+                    .clamp(1, capacity);
+                let queue = QueueSink {
+                    tx,
+                    lossless: lossless_kind,
+                    on_full: *on_full,
+                    strategy: Arc::clone(name),
+                    signals: Arc::clone(target.signals),
+                    slot,
+                    high,
+                    low: high / 2,
+                    lagging: false,
+                    depth: obs::gauge(obs::CHANNEL_DEPTH, &labels),
+                    wait: obs::histogram(obs::DISPATCH_WAIT, &labels),
+                    dropped: dropped(),
+                };
+                self.sinks.push(Sink {
+                    filter: filter.clone(),
+                    kind: SinkKind::Queue(queue),
+                });
+                None
+            }
+            Delivery::DropOldest { capacity } => {
+                let rx = match filter {
+                    None => {
+                        let cap = self.broadcast_capacity;
+                        let (tx, wakers) = self
+                            .broadcast
+                            .get_or_insert_with(|| (broadcast::channel(cap).0, Vec::new()));
+                        wakers.push(Arc::clone(target.signals));
+                        tx.subscribe()
+                    }
+                    Some(filter) => {
+                        let (tx, rx) = broadcast::channel(capacity);
+                        let kind = SinkKind::Broadcast {
+                            tx,
+                            wakers: vec![Arc::clone(target.signals)],
+                        };
+                        self.sinks.push(Sink {
+                            filter: Some(filter.clone()),
+                            kind,
+                        });
+                        rx
+                    }
+                };
+                Some(SideRx::Broadcast(BroadcastRx {
+                    slot,
+                    rx,
+                    dropped: dropped(),
+                }))
+            }
+            Delivery::Latest => {
+                let rx = match filter {
+                    None => {
+                        let (tx, wakers) = self
+                            .watch
+                            .get_or_insert_with(|| (watch::channel(None).0, Vec::new()));
+                        wakers.push(Arc::clone(target.signals));
+                        tx.subscribe()
+                    }
+                    Some(filter) => {
+                        let (tx, rx) = watch::channel(None);
+                        let kind = SinkKind::Watch {
+                            tx,
+                            wakers: vec![Arc::clone(target.signals)],
+                        };
+                        self.sinks.push(Sink {
+                            filter: Some(filter.clone()),
+                            kind,
+                        });
+                        rx
+                    }
+                };
+                Some(SideRx::Watch(rx))
+            }
+        }
     }
 }
 
@@ -92,12 +214,7 @@ impl<E: Send + Sync + 'static> Wiring<E> {
     ) -> StrategyRuntime<E, A> {
         let name: Arc<str> = reg.entry.name().into();
         let subs = &reg.subs.subs;
-        let mut sources: Vec<SourceId> = Vec::new();
-        for sub in subs {
-            if !sources.contains(&sub.source) {
-                sources.push(sub.source.clone());
-            }
-        }
+        let sources: Vec<SourceId> = subs.iter().map(|sub| sub.source.clone()).unique().collect();
         let (signals, wake) = Signals::new(&sources);
         let signals = Arc::new(signals);
         let max_cap = |pred: fn(&Delivery) -> bool| {
@@ -109,8 +226,6 @@ impl<E: Send + Sync + 'static> Wiring<E> {
         let lossless = max_cap(|d| matches!(d, Delivery::Lossless { .. })).map(mpsc::channel);
         let drop_newest = max_cap(|d| matches!(d, Delivery::DropNewest { .. })).map(mpsc::channel);
         let (system_tx, system_rx) = mpsc::unbounded_channel();
-        let mut broadcasts = Vec::new();
-        let mut watches = Vec::new();
         let collector_of = |source: &SourceId| {
             shared
                 .collectors
@@ -119,133 +234,33 @@ impl<E: Send + Sync + 'static> Wiring<E> {
                 .expect("validated")
         };
 
-        for sub in subs {
-            let wiring = &mut self.collectors[collector_of(&sub.source)];
-            let slot = signals.slot_of(&sub.source);
-            let Subscription {
-                source,
-                delivery,
-                filter,
-                on_full,
-            } = sub;
-            let labels = [("source", source.as_str()), ("strategy", &*name)];
-            let dropped = || {
-                obs::counter(
-                    obs::DROPPED,
-                    &[
-                        ("source", source.as_str()),
-                        ("strategy", &*name),
-                        ("delivery", delivery.label()),
-                    ],
-                )
-            };
-            match *delivery {
-                Delivery::Lossless { .. } | Delivery::DropNewest { .. } => {
-                    let lossless_kind = matches!(delivery, Delivery::Lossless { .. });
-                    let channel = if lossless_kind {
-                        &lossless
-                    } else {
-                        &drop_newest
-                    };
-                    let tx = channel
-                        .as_ref()
-                        .expect("channel exists for this delivery")
-                        .0
-                        .clone();
-                    let capacity = tx.max_capacity();
-                    let high = ((capacity as f64 * self.lagging_threshold).ceil() as usize)
-                        .clamp(1, capacity);
-                    let queue = QueueSink {
-                        tx,
-                        lossless: lossless_kind,
-                        on_full: *on_full,
-                        strategy: Arc::clone(&name),
-                        signals: Arc::clone(&signals),
-                        slot,
-                        high,
-                        low: high / 2,
-                        lagging: false,
-                        depth: obs::gauge(obs::CHANNEL_DEPTH, &labels),
-                        wait: obs::histogram(obs::DISPATCH_WAIT, &labels),
-                        dropped: dropped(),
-                    };
-                    wiring.sinks.push(Sink {
-                        filter: filter.clone(),
-                        kind: SinkKind::Queue(queue),
-                    });
-                }
-                Delivery::DropOldest { capacity } => {
-                    let rx = match filter {
-                        None => {
-                            let cap = wiring.broadcast_capacity;
-                            let (tx, wakers) = wiring
-                                .broadcast
-                                .get_or_insert_with(|| (broadcast::channel(cap).0, Vec::new()));
-                            wakers.push(Arc::clone(&signals));
-                            tx.subscribe()
-                        }
-                        Some(filter) => {
-                            let (tx, rx) = broadcast::channel(capacity);
-                            let kind = SinkKind::Broadcast {
-                                tx,
-                                wakers: vec![Arc::clone(&signals)],
-                            };
-                            wiring.sinks.push(Sink {
-                                filter: Some(filter.clone()),
-                                kind,
-                            });
-                            rx
-                        }
-                    };
-                    broadcasts.push(BroadcastRx {
-                        slot,
-                        rx,
-                        dropped: dropped(),
-                    });
-                }
-                Delivery::Latest => {
-                    let rx = match filter {
-                        None => {
-                            let (tx, wakers) = wiring
-                                .watch
-                                .get_or_insert_with(|| (watch::channel(None).0, Vec::new()));
-                            wakers.push(Arc::clone(&signals));
-                            tx.subscribe()
-                        }
-                        Some(filter) => {
-                            let (tx, rx) = watch::channel(None);
-                            let kind = SinkKind::Watch {
-                                tx,
-                                wakers: vec![Arc::clone(&signals)],
-                            };
-                            wiring.sinks.push(Sink {
-                                filter: Some(filter.clone()),
-                                kind,
-                            });
-                            rx
-                        }
-                    };
-                    watches.push(rx);
-                }
-            }
-        }
+        let target = Target {
+            name: &name,
+            signals: &signals,
+            lossless: lossless.as_ref().map(|(tx, _)| tx),
+            drop_newest: drop_newest.as_ref().map(|(tx, _)| tx),
+            lagging_threshold: self.lagging_threshold,
+        };
+        let (broadcasts, watches) = subs
+            .iter()
+            .filter_map(|sub| self.collectors[collector_of(&sub.source)].subscribe(sub, &target))
+            .partition_map(|rx| match rx {
+                SideRx::Broadcast(rx) => Either::Left(rx),
+                SideRx::Watch(rx) => Either::Right(rx),
+            });
 
-        for source in &sources {
+        sources.iter().for_each(|source| {
             let has_lossless = subs
                 .iter()
                 .any(|s| &s.source == source && matches!(s.delivery, Delivery::Lossless { .. }));
-            let inline = if has_lossless {
-                lossless.as_ref().map(|(tx, _)| tx.clone())
-            } else {
-                None
-            };
+            let inline = target.lossless.filter(|_| has_lossless).cloned();
             self.collectors[collector_of(source)]
                 .links
                 .push(StrategyLink {
                     inline,
                     side: system_tx.clone(),
                 });
-        }
+        });
 
         StrategyRuntime {
             index,

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{TryStream, TryStreamExt, stream};
+use itertools::Itertools;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -103,15 +104,11 @@ impl<E> ReplayCollector<E> {
 impl<E: DeserializeOwned> ReplayCollector<E> {
     /// Reads a JSONL file of [`Record`]s.
     pub fn from_jsonl(name: impl Into<String>, path: impl AsRef<Path>) -> io::Result<Self> {
-        let reader = BufReader::new(File::open(path)?);
-        let mut records = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            records.push(serde_json::from_str(&line).map_err(io::Error::other)?);
-        }
+        let records = BufReader::new(File::open(path)?)
+            .lines()
+            .filter_ok(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(&line?).map_err(io::Error::other))
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(Self::from_records(name, records))
     }
 }

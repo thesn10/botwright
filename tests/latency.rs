@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::{StreamExt, stream};
+
 use botwright::{
     BoxError, ChannelCollector, CollectorOpts, Delivery, Engine, Envelope, Strategy, StrategyCtx,
 };
@@ -50,12 +52,15 @@ async fn collector_to_on_event_latency_stays_below_the_limit() {
     let handle = engine.handle();
     let run = tokio::spawn(engine.run());
 
-    for i in 0..5_000 {
-        sender.send(i).await.unwrap();
-        if i % 10 == 0 {
-            tokio::time::sleep(Duration::from_micros(100)).await;
-        }
-    }
+    let sender = &sender;
+    stream::iter(0..5_000)
+        .for_each(|i| async move {
+            sender.send(i).await.unwrap();
+            if i % 10 == 0 {
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+        })
+        .await;
     while samples.lock().unwrap().len() < 5_000 {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }

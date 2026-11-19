@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -84,32 +85,46 @@ impl TelegramNotifier {
         }
         let mut last_sent = self.last_sent.lock().await;
         for attempt in 1..=MAX_ATTEMPTS {
-            if let Some(last) = *last_sent {
-                tokio::time::sleep_until(last + self.min_interval).await;
-            }
-            let response = self.client.post(&self.url).json(&body).send().await;
-            *last_sent = Some(Instant::now());
-            let response = response?;
-            let status = response.status();
-            let api: ApiResponse = response.json().await?;
-            if api.ok {
-                return Ok(());
-            }
-            let retry_after = api.parameters.and_then(|p| p.retry_after);
-            match retry_after {
-                Some(secs) if status.as_u16() == 429 && attempt < MAX_ATTEMPTS => {
-                    tracing::debug!(secs, "telegram rate limit");
-                    tokio::time::sleep(Duration::from_secs(secs)).await;
-                }
-                _ => {
-                    let description = api.description.unwrap_or_default();
-                    return Err(
-                        format!("telegram sendMessage failed ({status}): {description}").into(),
-                    );
-                }
+            if let Some(sent) = self
+                .attempt(&body, attempt, &mut last_sent)
+                .await
+                .transpose()
+            {
+                return sent;
             }
         }
         Err("telegram sendMessage failed: rate limited".into())
+    }
+
+    /// `Ok(None)` means rate limited, retry now.
+    async fn attempt(
+        &self,
+        body: &serde_json::Value,
+        attempt: u32,
+        last_sent: &mut Option<Instant>,
+    ) -> Result<Option<()>, BoxError> {
+        if let Some(last) = *last_sent {
+            tokio::time::sleep_until(last + self.min_interval).await;
+        }
+        let response = self.client.post(&self.url).json(body).send().await;
+        *last_sent = Some(Instant::now());
+        let response = response?;
+        let status = response.status();
+        let api: ApiResponse = response.json().await?;
+        if api.ok {
+            return Ok(Some(()));
+        }
+        match api.parameters.and_then(|p| p.retry_after) {
+            Some(secs) if status.as_u16() == 429 && attempt < MAX_ATTEMPTS => {
+                tracing::debug!(secs, "telegram rate limit");
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                Ok(None)
+            }
+            _ => {
+                let description = api.description.unwrap_or_default();
+                Err(format!("telegram sendMessage failed ({status}): {description}").into())
+            }
+        }
     }
 }
 
@@ -135,12 +150,14 @@ fn format(notification: &Notification, count: usize) -> String {
 
 impl NotificationSink for TelegramNotifier {
     async fn send(&self, batch: Vec<Notification>) -> Result<(), BoxError> {
-        let mut errors = Vec::new();
-        for (notification, count) in bundle(batch) {
-            if let Err(err) = self.send_text(format(&notification, count)).await {
-                errors.push(format!("`{}`: {err}", notification.title));
-            }
-        }
+        let errors: Vec<String> = stream::iter(bundle(batch))
+            .filter_map(|(notification, count)| async move {
+                let sent = self.send_text(format(&notification, count)).await;
+                sent.err()
+                    .map(|err| format!("`{}`: {err}", notification.title))
+            })
+            .collect()
+            .await;
         if errors.is_empty() {
             Ok(())
         } else {

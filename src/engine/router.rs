@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use tokio::sync::mpsc;
 
 use super::Shared;
@@ -21,52 +22,50 @@ pub(crate) struct Router<A> {
 }
 
 impl<A: Send + Sync + 'static> Router<A> {
+    fn routes_for<'a>(&'a self, action: &'a A) -> impl Iterator<Item = &'a Route<A>> {
+        self.routes
+            .iter()
+            .filter(move |route| (route.handles)(action))
+    }
+
     pub(crate) async fn submit(&self, action: Arc<A>) -> Result<(), SubmitError> {
-        let mut routed = false;
-        for route in &self.routes {
-            if !(route.handles)(&action) {
-                continue;
-            }
-            routed = true;
-            let pending = &self.shared.executors[route.index].pending;
-            pending.fetch_add(1, Ordering::AcqRel);
-            if route.tx.send(Arc::clone(&action)).await.is_err() {
-                pending.fetch_sub(1, Ordering::AcqRel);
-                return Err(SubmitError::Closed(route.name.to_string()));
-            }
-        }
-        if routed {
-            Ok(())
-        } else {
-            Err(SubmitError::Unrouted)
-        }
+        let routed = stream::iter(self.routes_for(&action))
+            .map(Ok)
+            .try_fold(false, |_, route| async {
+                let pending = &self.shared.executors[route.index].pending;
+                pending.fetch_add(1, Ordering::AcqRel);
+                route.tx.send(Arc::clone(&action)).await.map_err(|_| {
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                    SubmitError::Closed(route.name.to_string())
+                })?;
+                Ok(true)
+            })
+            .await?;
+        routed.then_some(()).ok_or(SubmitError::Unrouted)
     }
 
     pub(crate) fn try_submit(&self, action: Arc<A>) -> Result<(), SubmitError> {
-        let mut permits = Vec::new();
-        for route in &self.routes {
-            if !(route.handles)(&action) {
-                continue;
-            }
-            match route.tx.try_reserve() {
-                Ok(permit) => permits.push((route.index, permit)),
+        let permits = self
+            .routes_for(&action)
+            .map(|route| match route.tx.try_reserve() {
+                Ok(permit) => Ok((route.index, permit)),
                 Err(mpsc::error::TrySendError::Full(())) => {
-                    return Err(SubmitError::Full(route.name.to_string()));
+                    Err(SubmitError::Full(route.name.to_string()))
                 }
                 Err(mpsc::error::TrySendError::Closed(())) => {
-                    return Err(SubmitError::Closed(route.name.to_string()));
+                    Err(SubmitError::Closed(route.name.to_string()))
                 }
-            }
-        }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if permits.is_empty() {
             return Err(SubmitError::Unrouted);
         }
-        for (index, permit) in permits {
+        permits.into_iter().for_each(|(index, permit)| {
             self.shared.executors[index]
                 .pending
                 .fetch_add(1, Ordering::AcqRel);
             permit.send(Arc::clone(&action));
-        }
+        });
         Ok(())
     }
 }

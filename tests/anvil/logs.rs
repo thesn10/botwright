@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use futures::{StreamExt, stream};
+
 use botwright::eth::{BlockCollector, BlockCursor, Filter, LogCollector, Provider};
 use botwright::{Delivery, Engine, SystemEvent};
 
@@ -26,9 +28,9 @@ async fn log_gap_is_backfilled_exactly_once() {
     let (handle, run) = spawn(engine);
 
     until("connect", || record.connects("logs") == 1).await;
-    for v in 1..=3 {
-        emit(&provider, from, emitter, v).await;
-    }
+    stream::iter(1..=3)
+        .for_each(|v| emit(&provider, from, emitter, v))
+        .await;
     until("live logs", || record.added().len() == 3).await;
 
     proxy.cut();
@@ -39,15 +41,15 @@ async fn log_gap_is_backfilled_exactly_once() {
             .any(|e| matches!(e, SystemEvent::CollectorDisconnected { .. }))
     })
     .await;
-    for v in 4..=6 {
-        emit(&provider, from, emitter, v).await;
-    }
+    stream::iter(4..=6)
+        .for_each(|v| emit(&provider, from, emitter, v))
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     proxy.restore();
     until("reconnect", || record.connects("logs") == 2).await;
-    for v in 7..=9 {
-        emit(&provider, from, emitter, v).await;
-    }
+    stream::iter(7..=9)
+        .for_each(|v| emit(&provider, from, emitter, v))
+        .await;
     until("all logs", || record.added().len() >= 9).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -89,9 +91,9 @@ async fn reorg_reports_common_ancestor_and_removed_logs() {
     })
     .await;
 
-    for v in 1..=4 {
-        emit(&provider, from, emitter, v).await;
-    }
+    stream::iter(1..=4)
+        .for_each(|v| emit(&provider, from, emitter, v))
+        .await;
     until("logs", || record.added().len() == 4).await;
     let head = provider.get_block_number().await.unwrap();
     let ancestor = provider

@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use itertools::Itertools;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -181,21 +182,25 @@ where
             .enumerate()
             .map(|(i, c)| (c.name().to_owned(), i))
             .collect();
-        for reg in &self.strategies {
+        self.strategies.iter().try_for_each(|reg| {
             let name = reg.entry.name();
             reg.subs.validate(name)?;
-            for sub in &reg.subs.subs {
-                if !collector_index.contains_key(sub.source.as_str()) {
-                    return Err(BuildError::UnknownSource {
-                        strategy: name.to_owned(),
-                        source_name: sub.source.to_string(),
-                    });
-                }
+            if let Some(sub) = reg
+                .subs
+                .subs
+                .iter()
+                .find(|sub| !collector_index.contains_key(sub.source.as_str()))
+            {
+                return Err(BuildError::UnknownSource {
+                    strategy: name.to_owned(),
+                    source_name: sub.source.to_string(),
+                });
             }
             if matches!(reg.subs.on_panic, OnPanic::Restart { .. }) && !reg.entry.has_factory() {
                 return Err(BuildError::RestartWithoutFactory(name.to_owned()));
             }
-        }
+            Ok(())
+        })?;
 
         let request = CancellationToken::new();
         let shutdown = CancellationToken::new();
@@ -240,18 +245,21 @@ where
         let (fatal, fatal_rx) = mpsc::unbounded_channel();
         let notifier = self.notifier.unwrap_or_default();
 
-        let mut routes = Vec::new();
-        let mut executor_rx = Vec::new();
-        for (index, entry) in self.executors.iter().enumerate() {
-            let (tx, rx) = mpsc::channel(entry.queue_capacity());
-            routes.push(Route {
-                name: entry.name().into(),
-                index,
-                handles: entry.handles_fn(),
-                tx,
-            });
-            executor_rx.push(rx);
-        }
+        let (routes, executor_rx): (Vec<_>, Vec<_>) = self
+            .executors
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let (tx, rx) = mpsc::channel(entry.queue_capacity());
+                let route = Route {
+                    name: entry.name().into(),
+                    index,
+                    handles: entry.handles_fn(),
+                    tx,
+                };
+                (route, rx)
+            })
+            .unzip();
         let router = Arc::new(Router {
             routes,
             shared: Arc::clone(&shared),
@@ -260,36 +268,41 @@ where
         let collector_ids: Vec<SourceId> =
             shared.collectors.iter().map(|c| c.name.clone()).collect();
         let mut wiring = Wiring::new(&collector_ids, &self.strategies, self.lagging_threshold);
-        let mut strategy_runtimes = Vec::new();
-        for (index, reg) in self.strategies.iter().enumerate() {
-            strategy_runtimes
-                .push(wiring.strategy(index, reg, &shared, &fatal, &router, &notifier));
-        }
+        let strategy_runtimes: Vec<_> = self
+            .strategies
+            .iter()
+            .enumerate()
+            .map(|(index, reg)| wiring.strategy(index, reg, &shared, &fatal, &router, &notifier))
+            .collect();
 
-        let mut collector_tasks = Vec::new();
-        for (index, (entry, wired)) in self
+        let collector_tasks = self
             .collectors
             .into_iter()
             .zip(wiring.collectors)
             .enumerate()
-        {
-            let (sinks, links) = wired.finish();
-            let rt = CollectorRuntime {
-                id: SourceId::new(entry.name()),
-                index,
-                sinks,
-                links,
-                shared: Arc::clone(&shared),
-                fatal: fatal.clone(),
-            };
-            collector_tasks.push(entry.into_task(rt));
-        }
+            .map(|(index, (entry, wired))| {
+                let (sinks, links) = wired.finish();
+                let rt = CollectorRuntime {
+                    id: SourceId::new(entry.name()),
+                    index,
+                    sinks,
+                    links,
+                    shared: Arc::clone(&shared),
+                    fatal: fatal.clone(),
+                };
+                entry.into_task(rt)
+            })
+            .collect();
 
-        let mut strategy_tasks = Vec::new();
-        for (reg, rt) in self.strategies.into_iter().zip(strategy_runtimes) {
-            let (ready_tx, ready_rx) = oneshot::channel();
-            strategy_tasks.push((reg.entry.into_task(rt, ready_tx), ready_rx));
-        }
+        let strategy_tasks = self
+            .strategies
+            .into_iter()
+            .zip(strategy_runtimes)
+            .map(|(reg, rt)| {
+                let (ready_tx, ready_rx) = oneshot::channel();
+                (reg.entry.into_task(rt, ready_tx), ready_rx)
+            })
+            .collect();
 
         let executor_tasks = self
             .executors
@@ -324,14 +337,10 @@ fn check_unique<'a>(
     kind: &'static str,
     names: impl Iterator<Item = &'a str>,
 ) -> Result<(), BuildError> {
-    let mut seen = HashSet::new();
-    for name in names {
-        if !seen.insert(name) {
-            return Err(BuildError::DuplicateName {
-                kind,
-                name: name.to_owned(),
-            });
-        }
-    }
-    Ok(())
+    names.duplicates().next().map_or(Ok(()), |name| {
+        Err(BuildError::DuplicateName {
+            kind,
+            name: name.to_owned(),
+        })
+    })
 }

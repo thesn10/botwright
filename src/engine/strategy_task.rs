@@ -54,8 +54,7 @@ pub(crate) struct StrategyRuntime<E, A> {
 }
 
 enum Next<E> {
-    Event(Envelope<E>),
-    System(SystemEvent),
+    Msg(Msg<E>),
     Wake,
     Stop,
 }
@@ -132,41 +131,51 @@ where
         }
         let start = self.rotation;
         self.rotation = (start + 1) % 4;
-        for i in 0..4 {
-            let ready = match (start + i) % 4 {
+        (start..start + 4)
+            .find_map(|branch| match branch % 4 {
                 0 => match self.system.poll_recv(cx) {
-                    Poll::Ready(Some(ev)) => Some(Next::System(ev)),
+                    Poll::Ready(Some(ev)) => Some(Next::Msg(Msg::System(ev))),
                     _ => None,
                 },
-                1 => poll_queue(&mut self.lossless, cx),
-                2 => poll_queue(&mut self.drop_newest, cx),
+                1 => poll_queue(&mut self.lossless, cx).map(Next::Msg),
+                2 => poll_queue(&mut self.drop_newest, cx).map(Next::Msg),
                 _ => match self.wake.poll_recv(cx) {
                     Poll::Ready(Some(())) => Some(Next::Wake),
                     _ => None,
                 },
-            };
-            if let Some(next) = ready {
-                return Poll::Ready(next);
-            }
-        }
-        Poll::Pending
+            })
+            .map_or(Poll::Pending, Poll::Ready)
     }
 
-    fn try_next_queued(&mut self) -> Option<Next<E>> {
-        if let Ok(ev) = self.system.try_recv() {
-            return Some(Next::System(ev));
-        }
-        for rx in [&mut self.lossless, &mut self.drop_newest]
-            .into_iter()
-            .flatten()
-        {
-            match rx.try_recv() {
-                Ok(Msg::Event(env)) => return Some(Next::Event(env)),
-                Ok(Msg::System(ev)) => return Some(Next::System(ev)),
-                Err(_) => {}
+    fn try_next_queued(&mut self) -> Option<Msg<E>> {
+        self.system.try_recv().ok().map(Msg::System).or_else(|| {
+            [&mut self.lossless, &mut self.drop_newest]
+                .into_iter()
+                .flatten()
+                .find_map(|rx| rx.try_recv().ok())
+        })
+    }
+
+    fn try_recv_broadcast(&mut self, index: usize) -> Option<Msg<E>> {
+        let b = &mut self.broadcasts[index];
+        match b.rx.try_recv() {
+            Ok(env) => Some(Msg::Event(env)),
+            Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                b.dropped.increment(count);
+                let source = self.signals.slots[b.slot].source.clone();
+                Some(Msg::System(SystemEvent::Dropped { source, count }))
             }
+            Err(_) => None,
         }
-        None
+    }
+
+    fn take_latest(&mut self) -> Vec<Msg<E>> {
+        self.watches
+            .iter_mut()
+            .filter(|w| w.has_changed().unwrap_or(false))
+            .filter_map(|w| w.borrow_and_update().clone())
+            .map(Msg::Event)
+            .collect()
     }
 
     fn is_empty(&self) -> bool {
@@ -192,11 +201,10 @@ where
 fn poll_queue<E>(
     queue: &mut Option<mpsc::Receiver<Msg<E>>>,
     cx: &mut Context<'_>,
-) -> Option<Next<E>> {
+) -> Option<Msg<E>> {
     let rx = queue.as_mut()?;
     match rx.poll_recv(cx) {
-        Poll::Ready(Some(Msg::Event(env))) => Some(Next::Event(env)),
-        Poll::Ready(Some(Msg::System(ev))) => Some(Next::System(ev)),
+        Poll::Ready(Some(msg)) => Some(msg),
         Poll::Ready(None) => {
             *queue = None;
             None
@@ -249,8 +257,7 @@ where
             self.rt.set_idle(false);
             let result = match next {
                 Next::Stop => break,
-                Next::Event(env) => self.on_event(&env).await,
-                Next::System(ev) => self.on_system(&ev).await,
+                Next::Msg(msg) => self.dispatch(msg).await,
                 Next::Wake => self.drain_side().await,
             };
             if let Err(failure) = result
@@ -267,9 +274,7 @@ where
         let drained = tokio::time::timeout_at(deadline, async {
             loop {
                 let result = match self.rt.try_next_queued() {
-                    Some(Next::Event(env)) => self.on_event(&env).await,
-                    Some(Next::System(ev)) => self.on_system(&ev).await,
-                    Some(Next::Wake | Next::Stop) => Ok(()),
+                    Some(msg) => self.dispatch(msg).await,
                     None if !self.rt.is_empty() => {
                         let _ = self.rt.wake.try_recv();
                         self.drain_side().await
@@ -292,6 +297,20 @@ where
         let _ = tokio::time::timeout_at(deadline, self.on_system(&SystemEvent::ShutdownRequested))
             .await;
         self.rt.set_idle(true);
+    }
+
+    async fn dispatch(&mut self, msg: Msg<E>) -> Result<(), Failure> {
+        match msg {
+            Msg::Event(env) => self.on_event(&env).await,
+            Msg::System(event) => self.on_system(&event).await,
+        }
+    }
+
+    async fn dispatch_all(&mut self, msgs: Vec<Msg<E>>) -> Result<(), Failure> {
+        for msg in msgs {
+            self.dispatch(msg).await?;
+        }
+        Ok(())
     }
 
     async fn on_event(&mut self, env: &Envelope<E>) -> Result<(), Failure> {
@@ -325,54 +344,26 @@ where
     }
 
     async fn drain_side(&mut self) -> Result<(), Failure> {
-        for i in 0..self.rt.signals.slots.len() {
-            let slot = &self.rt.signals.slots[i];
-            let dropped = slot.dropped.swap(0, Ordering::AcqRel);
-            let lagging = slot.lagging.swap(0, Ordering::AcqRel);
-            let source = slot.source.clone();
-            if dropped > 0 {
-                self.on_system(&SystemEvent::Dropped {
-                    source: source.clone(),
-                    count: dropped,
-                })
-                .await?;
-            }
-            if lagging > 0 {
-                self.on_system(&SystemEvent::Lagging {
-                    source,
-                    depth: lagging,
-                })
-                .await?;
-            }
+        let signals = self.rt.signals.take().map(Msg::System).collect();
+        self.dispatch_all(signals).await?;
+        for index in 0..self.rt.broadcasts.len() {
+            self.drain_broadcast(index).await?;
         }
-        let mut more = false;
-        for i in 0..self.rt.broadcasts.len() {
-            for _ in 0..SIDE_BUDGET {
-                let received = self.rt.broadcasts[i].rx.try_recv();
-                match received {
-                    Ok(env) => self.on_event(&env).await?,
-                    Err(broadcast::error::TryRecvError::Lagged(count)) => {
-                        let b = &self.rt.broadcasts[i];
-                        b.dropped.increment(count);
-                        let source = self.rt.signals.slots[b.slot].source.clone();
-                        self.on_system(&SystemEvent::Dropped { source, count })
-                            .await?;
-                    }
-                    Err(_) => break,
-                }
-            }
-            more |= !self.rt.broadcasts[i].rx.is_empty();
-        }
-        for i in 0..self.rt.watches.len() {
-            if self.rt.watches[i].has_changed().unwrap_or(false) {
-                let latest = self.rt.watches[i].borrow_and_update().clone();
-                if let Some(env) = latest {
-                    self.on_event(&env).await?;
-                }
-            }
-        }
-        if more {
+        let latest = self.rt.take_latest();
+        self.dispatch_all(latest).await?;
+        if self.rt.broadcasts.iter().any(|b| !b.rx.is_empty()) {
             self.rt.signals.wake();
+        }
+        Ok(())
+    }
+
+    async fn drain_broadcast(&mut self, index: usize) -> Result<(), Failure> {
+        let mut budget = SIDE_BUDGET;
+        while budget > 0
+            && let Some(msg) = self.rt.try_recv_broadcast(index)
+        {
+            budget -= 1;
+            self.dispatch(msg).await?;
         }
         Ok(())
     }
@@ -404,13 +395,7 @@ where
         };
         loop {
             let now = Instant::now();
-            while self
-                .restarts
-                .front()
-                .is_some_and(|t| now.duration_since(*t) >= within)
-            {
-                self.restarts.pop_front();
-            }
+            self.restarts.retain(|t| now.duration_since(*t) < within);
             if self.restarts.len() >= max as usize {
                 tracing::error!(panic = %reason, max, ?within, "restart limit exceeded");
                 let message = format!("{reason} (more than {max} restarts within {within:?})");
@@ -440,10 +425,10 @@ where
                     continue;
                 }
             }
-            let mut notices = vec![SystemEvent::Restarted {
+            let notices = std::iter::once(SystemEvent::Restarted {
                 reason: reason.clone(),
-            }];
-            notices.extend(
+            })
+            .chain(
                 self.rt
                     .signals
                     .slots
@@ -453,27 +438,19 @@ where
                         from: None,
                         to: None,
                     }),
-            );
-            let mut panicked = None;
-            for notice in &notices {
-                match self.on_system(notice).await {
-                    Ok(()) => {}
-                    Err(Failure::Error(error)) => {
-                        let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
-                            strategy: name,
-                            error,
-                        });
-                        return false;
-                    }
-                    Err(Failure::Panic(message)) => {
-                        panicked = Some(message);
-                        break;
-                    }
+            )
+            .map(Msg::System)
+            .collect();
+            match self.dispatch_all(notices).await {
+                Ok(()) => return true,
+                Err(Failure::Error(error)) => {
+                    let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
+                        strategy: name,
+                        error,
+                    });
+                    return false;
                 }
-            }
-            match panicked {
-                Some(message) => reason = message,
-                None => return true,
+                Err(Failure::Panic(message)) => reason = message,
             }
         }
     }

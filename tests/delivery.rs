@@ -10,7 +10,7 @@ use botwright::{
     ExitReason, Item, OnFull, Strategy, StrategyCtx, SystemEvent,
 };
 use common::{Log, Recorder, is_sorted_strictly};
-use futures::{TryStream, stream};
+use futures::{StreamExt, TryStream, stream};
 use tokio::time::Instant;
 
 #[derive(Clone)]
@@ -133,9 +133,9 @@ impl Strategy<u64, u64> for SlowYield {
         e: &Envelope<u64>,
         _: &mut StrategyCtx<u64>,
     ) -> Result<(), BoxError> {
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
+        stream::iter(0..4)
+            .for_each(|_| tokio::task::yield_now())
+            .await;
         self.log.push(common::Seen::Event {
             source: e.source.to_string(),
             seq: e.seq,

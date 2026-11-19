@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::SourceId;
+use crate::{SourceId, SystemEvent};
 
 /// Out-of-band notices from collectors to one strategy; `wake` is a coalescing doorbell.
 pub(crate) struct Signals {
@@ -39,6 +39,26 @@ impl Signals {
             .iter()
             .position(|s| &s.source == source)
             .expect("slot exists for every subscribed source")
+    }
+
+    pub(crate) fn take(&self) -> impl Iterator<Item = SystemEvent> + '_ {
+        self.slots.iter().flat_map(|slot| {
+            let dropped = slot.dropped.swap(0, Ordering::AcqRel);
+            let lagging = slot.lagging.swap(0, Ordering::AcqRel);
+            let source = &slot.source;
+            [
+                (dropped > 0).then(|| SystemEvent::Dropped {
+                    source: source.clone(),
+                    count: dropped,
+                }),
+                (lagging > 0).then(|| SystemEvent::Lagging {
+                    source: source.clone(),
+                    depth: lagging,
+                }),
+            ]
+            .into_iter()
+            .flatten()
+        })
     }
 
     pub(crate) fn pending(&self) -> bool {

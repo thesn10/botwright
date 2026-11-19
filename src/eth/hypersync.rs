@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use hypersync_client::net_types::{LogField, LogFilter, Query};
 use hypersync_client::simple_types;
+use itertools::Itertools;
 
 use super::alloy::network::Network;
 use super::alloy::primitives::{Address, B256, Bytes, LogData};
@@ -60,20 +61,21 @@ fn log_filter(filter: &Filter) -> Result<LogFilter, CollectorError> {
             .and_address(filter.address.iter().map(|a| a.0.0))
             .map_err(CollectorError::other)?;
     }
-    for (i, topic) in filter.topics.iter().enumerate() {
-        if topic.is_empty() {
-            continue;
-        }
-        let values = topic.iter().map(|t| t.0);
-        selection = match i {
-            0 => selection.and_topic0(values),
-            1 => selection.and_topic1(values),
-            2 => selection.and_topic2(values),
-            _ => selection.and_topic3(values),
-        }
-        .map_err(CollectorError::other)?;
-    }
-    Ok(selection)
+    filter
+        .topics
+        .iter()
+        .enumerate()
+        .filter(|(_, topic)| !topic.is_empty())
+        .try_fold(selection, |selection, (i, topic)| {
+            let values = topic.iter().map(|t| t.0);
+            match i {
+                0 => selection.and_topic0(values),
+                1 => selection.and_topic1(values),
+                2 => selection.and_topic2(values),
+                _ => selection.and_topic3(values),
+            }
+            .map_err(CollectorError::other)
+        })
 }
 
 fn convert(log: simple_types::Log) -> Result<Log, CollectorError> {
@@ -123,9 +125,13 @@ impl<N: Network> LogBackfill<N> for HyperSyncBackfill {
                 .get(&query)
                 .await
                 .map_err(CollectorError::transport)?;
-            for log in response.data.logs.into_iter().flatten() {
-                logs.push(convert(log)?);
-            }
+            response
+                .data
+                .logs
+                .into_iter()
+                .flatten()
+                .map(convert)
+                .process_results(|converted| logs.extend(converted))?;
             if response.next_block <= start {
                 break;
             }

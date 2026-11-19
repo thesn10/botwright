@@ -3,9 +3,10 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use super::signals::Signals;
@@ -149,6 +150,43 @@ impl<E: Send + Sync + 'static> QueueSink<E> {
     }
 }
 
+impl<E: Send + Sync + 'static> Sink<E> {
+    fn accepts(&self, env: &Envelope<E>) -> bool {
+        self.filter.as_ref().is_none_or(|filter| filter(&env.event))
+    }
+
+    async fn deliver(&mut self, env: &Envelope<E>, rt: &CollectorShared<'_>) -> Result<(), Halt> {
+        match &mut self.kind {
+            SinkKind::Queue(queue) => return queue.push(env.clone(), rt).await,
+            SinkKind::Broadcast { tx, wakers } => {
+                let _ = tx.send(env.clone());
+                wakers.iter().for_each(|w| w.wake());
+            }
+            SinkKind::Watch { tx, wakers } => {
+                tx.send_replace(Some(env.clone()));
+                wakers.iter().for_each(|w| w.wake());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<E> StrategyLink<E> {
+    async fn send(&self, event: &SystemEvent, stop: &CancellationToken) -> Result<(), Halt> {
+        match &self.inline {
+            Some(tx) => tokio::select! {
+                biased;
+                () = stop.cancelled() => return Err(Halt::Stopped),
+                _ = tx.send(Msg::System(event.clone())) => {}
+            },
+            None => {
+                let _ = self.side.send(event.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
 struct CollectorShared<'a> {
     id: &'a SourceId,
     shared: &'a Shared,
@@ -162,41 +200,18 @@ impl<E: Send + Sync + 'static> CollectorRuntime<E> {
             shared: &self.shared,
             fatal: &self.fatal,
         };
-        for sink in &mut self.sinks {
-            if let Some(filter) = &sink.filter
-                && !filter(&env.event)
-            {
-                continue;
-            }
-            match &mut sink.kind {
-                SinkKind::Queue(queue) => queue.push(env.clone(), &rt).await?,
-                SinkKind::Broadcast { tx, wakers } => {
-                    let _ = tx.send(env.clone());
-                    wakers.iter().for_each(|w| w.wake());
-                }
-                SinkKind::Watch { tx, wakers } => {
-                    tx.send_replace(Some(env.clone()));
-                    wakers.iter().for_each(|w| w.wake());
-                }
-            }
-        }
-        Ok(())
+        stream::iter(self.sinks.iter_mut().filter(|sink| sink.accepts(&env)))
+            .map(Ok)
+            .try_for_each(|sink| sink.deliver(&env, &rt))
+            .await
     }
 
     async fn system(&self, event: SystemEvent) -> Result<(), Halt> {
-        for link in &self.links {
-            match &link.inline {
-                Some(tx) => tokio::select! {
-                    biased;
-                    () = self.shared.collectors_stop.cancelled() => return Err(Halt::Stopped),
-                    _ = tx.send(Msg::System(event.clone())) => {}
-                },
-                None => {
-                    let _ = link.side.send(event.clone());
-                }
-            }
-        }
-        Ok(())
+        let stop = &self.shared.collectors_stop;
+        stream::iter(&self.links)
+            .map(Ok)
+            .try_for_each(|link| link.send(&event, stop))
+            .await
     }
 
     fn state(&self) -> &super::CollectorState {

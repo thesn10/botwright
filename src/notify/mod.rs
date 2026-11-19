@@ -164,10 +164,9 @@ impl QueuedNotifier {
         let (tx, mut rx) = mpsc::channel::<Notification>(capacity.max(1));
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
-                let mut batch = vec![first];
-                while let Ok(next) = rx.try_recv() {
-                    batch.push(next);
-                }
+                let batch = std::iter::once(first)
+                    .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                    .collect();
                 if let Err(err) = sink.send(batch).await {
                     tracing::warn!(error = %err, "sending notifications failed");
                 }
@@ -205,11 +204,10 @@ impl fmt::Debug for QueuedNotifier {
 
 /// Groups notifications with equal level and title, keeping first-seen order.
 pub fn bundle(batch: Vec<Notification>) -> Vec<(Notification, usize)> {
-    let mut groups: Vec<(Notification, usize)> = Vec::new();
-    for n in batch {
+    batch.into_iter().fold(Vec::new(), |mut groups, n| {
         match groups
             .iter_mut()
-            .find(|(g, _)| g.level == n.level && g.title == n.title)
+            .find(|(g, _): &&mut (Notification, usize)| g.level == n.level && g.title == n.title)
         {
             Some((group, count)) => {
                 *count += 1;
@@ -218,8 +216,8 @@ pub fn bundle(batch: Vec<Notification>) -> Vec<(Notification, usize)> {
             }
             None => groups.push((n, 1)),
         }
-    }
-    groups
+        groups
+    })
 }
 
 #[cfg(test)]

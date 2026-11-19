@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use futures::future::join_all;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use super::alloy::primitives::{B256, Bytes, TxHash, hex, keccak256};
@@ -187,21 +188,18 @@ where
                 .map(|url| self.send_to(url, &body, &signature)),
         )
         .await;
-        let mut accepted = 0;
-        let mut errors = Vec::new();
-        for result in results {
-            match result {
-                Ok(result) => {
-                    accepted += 1;
-                    let bundle_hash = result
-                        .get("bundleHash")
-                        .and_then(|h| h.as_str())
-                        .and_then(|h| h.parse::<B256>().ok());
-                    tracing::debug!(?bundle_hash, block = bundle.block_number, "bundle accepted");
-                }
-                Err(err) => errors.push(err.to_string()),
-            }
-        }
+        let (accepted, errors): (Vec<_>, Vec<_>) = results
+            .into_iter()
+            .map(|result| result.map_err(|err| err.to_string()))
+            .partition_result();
+        accepted.iter().for_each(|result| {
+            let bundle_hash = result
+                .get("bundleHash")
+                .and_then(|h| h.as_str())
+                .and_then(|h| h.parse::<B256>().ok());
+            tracing::debug!(?bundle_hash, block = bundle.block_number, "bundle accepted");
+        });
+        let accepted = accepted.len();
         if !errors.is_empty() {
             tracing::warn!(errors = ?errors, accepted, "bundle rejected by some builders");
         }

@@ -60,25 +60,24 @@ impl Strategy<Event, Action> for Bidder {
 
 fn recording_file() -> PathBuf {
     let path = std::env::temp_dir().join(format!("botwright-replay-{}.jsonl", std::process::id()));
-    let mut lines = String::new();
-    for i in 0..300u64 {
-        let event = if i % 10 == 0 {
-            Event::Block(i / 10)
-        } else {
-            Event::Price {
-                pair: ["ETH/USDC", "BTC/USDC"][(i % 2) as usize].into(),
-                price: 1000 + i * 7,
-            }
-        };
-        lines.push_str(
-            &serde_json::to_string(&Record {
+    let lines: String = (0..300u64)
+        .map(|i| {
+            let event = if i % 10 == 0 {
+                Event::Block(i / 10)
+            } else {
+                Event::Price {
+                    pair: ["ETH/USDC", "BTC/USDC"][(i % 2) as usize].into(),
+                    price: 1000 + i * 7,
+                }
+            };
+            serde_json::to_string(&Record {
                 at_ms: i * 3,
                 event,
             })
-            .unwrap(),
-        );
-        lines.push('\n');
-    }
+            .unwrap()
+                + "\n"
+        })
+        .collect();
     std::fs::write(&path, lines).unwrap();
     path
 }
