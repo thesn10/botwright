@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
+use std::iter;
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,12 +68,18 @@ enum Failure {
 
 struct Loop<E, A, S, F> {
     rt: StrategyRuntime<E, A>,
-    strategy: S,
+    handler: Handler<E, A, S>,
     factory: Option<F>,
-    ctx: StrategyCtx<A>,
     restarts: VecDeque<Instant>,
-    handle_time: obs::Histogram,
     restart_counter: obs::Counter,
+}
+
+struct Handler<E, A, S> {
+    strategy: S,
+    ctx: StrategyCtx<A>,
+    on_error: OnError,
+    handle_time: obs::Histogram,
+    _event: PhantomData<fn(&E)>,
 }
 
 pub(crate) async fn run_strategy<E, A, S, F>(
@@ -88,13 +96,18 @@ pub(crate) async fn run_strategy<E, A, S, F>(
     let span = tracing::info_span!("strategy", name = %rt.name);
     let ctx = rt.new_ctx();
     let label = [("strategy", &*rt.name)];
-    let mut this = Loop {
+    let handler = Handler {
+        strategy: first,
+        ctx,
+        on_error: rt.on_error,
         handle_time: obs::histogram(obs::EVENT_HANDLE, &label),
+        _event: PhantomData,
+    };
+    let mut this = Loop {
         restart_counter: obs::counter(obs::RESTARTS, &label),
         rt,
-        strategy: first,
+        handler,
         factory,
-        ctx,
         restarts: VecDeque::new(),
     };
     this.run(ready).instrument(span).await;
@@ -156,26 +169,25 @@ where
         })
     }
 
-    fn try_recv_broadcast(&mut self, index: usize) -> Option<Msg<E>> {
-        let b = &mut self.broadcasts[index];
-        match b.rx.try_recv() {
-            Ok(env) => Some(Msg::Event(env)),
-            Err(broadcast::error::TryRecvError::Lagged(count)) => {
-                b.dropped.increment(count);
-                let source = self.signals.slots[b.slot].source.clone();
-                Some(Msg::System(SystemEvent::Dropped { source, count }))
-            }
-            Err(_) => None,
-        }
-    }
-
-    fn take_latest(&mut self) -> Vec<Msg<E>> {
-        self.watches
+    fn side(&mut self) -> impl Iterator<Item = Msg<E>> {
+        let signals = &*self.signals;
+        let broadcasts = self
+            .broadcasts
             .iter_mut()
-            .filter(|w| w.has_changed().unwrap_or(false))
-            .filter_map(|w| w.borrow_and_update().clone())
-            .map(Msg::Event)
-            .collect()
+            .flat_map(move |b| iter::from_fn(move || b.try_recv(signals)).take(SIDE_BUDGET));
+        let latest = self
+            .watches
+            .iter_mut()
+            .filter_map(|w| match w.has_changed() {
+                Ok(true) => w.borrow_and_update().clone(),
+                _ => None,
+            })
+            .map(Msg::Event);
+        signals
+            .take()
+            .map(Msg::System)
+            .chain(broadcasts)
+            .chain(latest)
     }
 
     fn is_empty(&self) -> bool {
@@ -195,6 +207,20 @@ where
         self.shared.strategies[self.index]
             .idle
             .store(idle, Ordering::Release);
+    }
+}
+
+impl<E> BroadcastRx<E> {
+    fn try_recv(&mut self, signals: &Signals) -> Option<Msg<E>> {
+        match self.rx.try_recv() {
+            Ok(env) => Some(Msg::Event(env)),
+            Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                self.dropped.increment(count);
+                let source = signals.slots[self.slot].source.clone();
+                Some(Msg::System(SystemEvent::Dropped { source, count }))
+            }
+            Err(_) => None,
+        }
     }
 }
 
@@ -222,6 +248,54 @@ async fn guarded(
         .map_err(|panic| panic_message(&*panic))
 }
 
+impl<E, A, S> Handler<E, A, S>
+where
+    E: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    S: Strategy<E, A>,
+{
+    async fn init(&mut self) -> Result<Result<(), BoxError>, String> {
+        guarded(self.strategy.init(&mut self.ctx)).await
+    }
+
+    async fn dispatch(&mut self, msg: Msg<E>) -> Result<(), Failure> {
+        match msg {
+            Msg::Event(env) => self.on_event(&env).await,
+            Msg::System(event) => self.on_system(&event).await,
+        }
+    }
+
+    async fn on_event(&mut self, env: &Envelope<E>) -> Result<(), Failure> {
+        let started = Instant::now();
+        let span = tracing::debug_span!("event", source = %env.source, seq = env.seq);
+        let result = guarded(self.strategy.on_event(env, &mut self.ctx))
+            .instrument(span)
+            .await;
+        self.handle_time.record(started.elapsed().as_secs_f64());
+        self.classify(result)
+    }
+
+    async fn on_system(&mut self, event: &SystemEvent) -> Result<(), Failure> {
+        tracing::debug!(?event, "system event");
+        let result = guarded(self.strategy.on_system(event, &mut self.ctx)).await;
+        self.classify(result)
+    }
+
+    fn classify(&self, result: Result<Result<(), BoxError>, String>) -> Result<(), Failure> {
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => match self.on_error {
+                OnError::LogAndContinue => {
+                    tracing::warn!(error = %err, "handler failed");
+                    Ok(())
+                }
+                OnError::Abort => Err(Failure::Error(err.to_string())),
+            },
+            Err(message) => Err(Failure::Panic(message)),
+        }
+    }
+}
+
 impl<E, A, S, F> Loop<E, A, S, F>
 where
     E: Send + Sync + 'static,
@@ -230,7 +304,7 @@ where
     F: FnMut() -> S + Send + 'static,
 {
     async fn run(&mut self, ready: oneshot::Sender<bool>) {
-        let init = guarded(self.strategy.init(&mut self.ctx)).await;
+        let init = self.handler.init().await;
         let init_failure = match init {
             Ok(Ok(())) => None,
             Ok(Err(err)) => Some(ExitReason::StrategyFailed {
@@ -257,7 +331,7 @@ where
             self.rt.set_idle(false);
             let result = match next {
                 Next::Stop => break,
-                Next::Msg(msg) => self.dispatch(msg).await,
+                Next::Msg(msg) => self.handler.dispatch(msg).await,
                 Next::Wake => self.drain_side().await,
             };
             if let Err(failure) = result
@@ -274,7 +348,7 @@ where
         let drained = tokio::time::timeout_at(deadline, async {
             loop {
                 let result = match self.rt.try_next_queued() {
-                    Some(msg) => self.dispatch(msg).await,
+                    Some(msg) => self.handler.dispatch(msg).await,
                     None if !self.rt.is_empty() => {
                         let _ = self.rt.wake.try_recv();
                         self.drain_side().await
@@ -294,76 +368,40 @@ where
             Ok(true) => {}
             Err(_) => tracing::warn!("shutdown timeout reached before the channels were drained"),
         }
-        let _ = tokio::time::timeout_at(deadline, self.on_system(&SystemEvent::ShutdownRequested))
-            .await;
+        let _ = tokio::time::timeout_at(
+            deadline,
+            self.handler.on_system(&SystemEvent::ShutdownRequested),
+        )
+        .await;
         self.rt.set_idle(true);
     }
 
-    async fn dispatch(&mut self, msg: Msg<E>) -> Result<(), Failure> {
-        match msg {
-            Msg::Event(env) => self.on_event(&env).await,
-            Msg::System(event) => self.on_system(&event).await,
-        }
-    }
-
-    async fn dispatch_all(&mut self, msgs: Vec<Msg<E>>) -> Result<(), Failure> {
-        for msg in msgs {
-            self.dispatch(msg).await?;
-        }
-        Ok(())
-    }
-
-    async fn on_event(&mut self, env: &Envelope<E>) -> Result<(), Failure> {
-        let started = Instant::now();
-        let span = tracing::debug_span!("event", source = %env.source, seq = env.seq);
-        let result = guarded(self.strategy.on_event(env, &mut self.ctx))
-            .instrument(span)
-            .await;
-        self.handle_time.record(started.elapsed().as_secs_f64());
-        self.classify(result)
-    }
-
-    async fn on_system(&mut self, event: &SystemEvent) -> Result<(), Failure> {
-        tracing::debug!(?event, "system event");
-        let result = guarded(self.strategy.on_system(event, &mut self.ctx)).await;
-        self.classify(result)
-    }
-
-    fn classify(&self, result: Result<Result<(), BoxError>, String>) -> Result<(), Failure> {
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => match self.rt.on_error {
-                OnError::LogAndContinue => {
-                    tracing::warn!(error = %err, "handler failed");
-                    Ok(())
-                }
-                OnError::Abort => Err(Failure::Error(err.to_string())),
-            },
-            Err(message) => Err(Failure::Panic(message)),
-        }
-    }
-
     async fn drain_side(&mut self) -> Result<(), Failure> {
-        let signals = self.rt.signals.take().map(Msg::System).collect();
-        self.dispatch_all(signals).await?;
-        for index in 0..self.rt.broadcasts.len() {
-            self.drain_broadcast(index).await?;
+        for msg in self.rt.side() {
+            self.handler.dispatch(msg).await?;
         }
-        let latest = self.rt.take_latest();
-        self.dispatch_all(latest).await?;
         if self.rt.broadcasts.iter().any(|b| !b.rx.is_empty()) {
             self.rt.signals.wake();
         }
         Ok(())
     }
 
-    async fn drain_broadcast(&mut self, index: usize) -> Result<(), Failure> {
-        let mut budget = SIDE_BUDGET;
-        while budget > 0
-            && let Some(msg) = self.rt.try_recv_broadcast(index)
-        {
-            budget -= 1;
-            self.dispatch(msg).await?;
+    async fn announce_restart(&mut self, reason: &str) -> Result<(), Failure> {
+        let restarted = SystemEvent::Restarted {
+            reason: reason.to_owned(),
+        };
+        let gaps = self
+            .rt
+            .signals
+            .slots
+            .iter()
+            .map(|slot| SystemEvent::GapUnfilled {
+                source: slot.source.clone(),
+                from: None,
+                to: None,
+            });
+        for event in iter::once(restarted).chain(gaps) {
+            self.handler.on_system(&event).await?;
         }
         Ok(())
     }
@@ -408,10 +446,10 @@ where
             self.restarts.push_back(now);
             self.restart_counter.increment(1);
             tracing::warn!(panic = %reason, "strategy panicked, rebuilding");
-            self.ctx.tasks.token.cancel();
-            self.ctx = self.rt.new_ctx();
-            self.strategy = (self.factory.as_mut().expect("checked above"))();
-            match guarded(self.strategy.init(&mut self.ctx)).await {
+            self.handler.ctx.tasks.token.cancel();
+            self.handler.ctx = self.rt.new_ctx();
+            self.handler.strategy = (self.factory.as_mut().expect("checked above"))();
+            match self.handler.init().await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
@@ -425,24 +463,12 @@ where
                     continue;
                 }
             }
-            let notices = std::iter::once(SystemEvent::Restarted {
-                reason: reason.clone(),
-            })
-            .chain(
-                self.rt
-                    .signals
-                    .slots
-                    .iter()
-                    .map(|slot| SystemEvent::GapUnfilled {
-                        source: slot.source.clone(),
-                        from: None,
-                        to: None,
-                    }),
-            )
-            .map(Msg::System)
-            .collect();
-            match self.dispatch_all(notices).await {
-                Ok(()) => return true,
+            match self.announce_restart(&reason).await {
+                Ok(()) => {
+                    // the panic may have interrupted a drain and left side work without a wake
+                    self.rt.signals.wake();
+                    return true;
+                }
                 Err(Failure::Error(error)) => {
                     let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
                         strategy: name,

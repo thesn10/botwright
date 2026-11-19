@@ -7,6 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- After a strategy restart, `Dropped` and `Lagging` notices and `Latest` values left over from the
+  interrupted drain are delivered right away instead of waiting for the next drop or update.
+
 ## [0.1.0] - 2026-11-18
 
 ### Added

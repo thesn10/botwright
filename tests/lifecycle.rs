@@ -520,3 +520,87 @@ fn init_runs_before_collectors_and_its_failure_ends_the_engine() {
 fn source_id_compares_with_str() {
     assert_eq!(SourceId::from("a"), "a");
 }
+
+struct PanicsOnFirstDrop {
+    log: Log,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Strategy<u64, u64> for PanicsOnFirstDrop {
+    fn name(&self) -> &str {
+        "dropper"
+    }
+
+    async fn on_event(
+        &mut self,
+        e: &Envelope<u64>,
+        _: &mut StrategyCtx<u64>,
+    ) -> Result<(), BoxError> {
+        self.log.push(common::Seen::Event {
+            source: e.source.to_string(),
+            seq: e.seq,
+            value: *e.event,
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        Ok(())
+    }
+
+    async fn on_system(
+        &mut self,
+        e: &SystemEvent,
+        _: &mut StrategyCtx<u64>,
+    ) -> Result<(), BoxError> {
+        self.log.push(common::Seen::System(e.clone()));
+        if matches!(e, SystemEvent::Dropped { .. }) && !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("first drop");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn drops_stay_reported_when_the_strategy_panics_on_a_drop_notice() {
+    const N: u64 = 200;
+    let log = Log::default();
+    let panicked = Arc::new(AtomicBool::new(false));
+    let (l, p) = (log.clone(), Arc::clone(&panicked));
+    let report = Harness::new(
+        Engine::<u64, u64>::builder()
+            .collector(
+                ReplayCollector::from_events("a", 1..=N),
+                CollectorOpts::default(),
+            )
+            .collector(
+                ReplayCollector::from_events("b", 1..=N),
+                CollectorOpts::default(),
+            )
+            .strategy_with_factory(
+                move || PanicsOnFirstDrop {
+                    log: l.clone(),
+                    panicked: Arc::clone(&p),
+                },
+                |s| {
+                    s.from("a", Delivery::DropNewest { capacity: 4 })
+                        .from("b", Delivery::DropNewest { capacity: 4 })
+                        .on_panic(OnPanic::Restart {
+                            max: 1,
+                            within: Duration::from_secs(60),
+                        })
+                },
+            ),
+    )
+    .run();
+    assert!(report.completed, "{:?}", report.exit);
+    assert!(panicked.load(Ordering::SeqCst));
+    let systems = log.systems();
+    for source in ["a", "b"] {
+        let dropped: u64 = systems
+            .iter()
+            .map(|e| match e {
+                SystemEvent::Dropped { source: s, count } if s == source => *count,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(log.values(source).len() as u64 + dropped, N, "{source}");
+    }
+}
