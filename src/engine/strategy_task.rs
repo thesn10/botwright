@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
-use futures::FutureExt;
+use futures::{FutureExt, Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::WaitForCancellationFutureOwned;
@@ -52,7 +52,43 @@ pub(crate) struct StrategyRuntime<E, A> {
     pub(crate) notifier: NotifierHandle,
     pub(crate) shared: Arc<Shared>,
     pub(crate) fatal: Fatal,
-    pub(crate) rotation: usize,
+}
+
+/// Every channel a strategy reads, as one stream that ends when the engine stops strategies.
+struct Inbox<E> {
+    index: usize,
+    lossless: Option<mpsc::Receiver<Msg<E>>>,
+    drop_newest: Option<mpsc::Receiver<Msg<E>>>,
+    broadcasts: Vec<BroadcastRx<E>>,
+    watches: Vec<watch::Receiver<Option<Envelope<E>>>>,
+    system: mpsc::UnboundedReceiver<SystemEvent>,
+    wake: mpsc::Receiver<()>,
+    signals: Arc<Signals>,
+    shared: Arc<Shared>,
+    stop: Pin<Box<WaitForCancellationFutureOwned>>,
+    rotation: usize,
+    side: Option<Side>,
+}
+
+/// Position in the side drain: signal slots, then broadcasts (with budget), then watches.
+#[derive(Clone, Copy)]
+enum Side {
+    Dropped(usize),
+    Lagging(usize),
+    Broadcast(usize, usize),
+    Watch(usize),
+}
+
+struct Env<A> {
+    index: usize,
+    name: Arc<str>,
+    on_panic: OnPanic,
+    max_tasks: usize,
+    router: Arc<Router<A>>,
+    notifier: NotifierHandle,
+    shared: Arc<Shared>,
+    fatal: Fatal,
+    signals: Arc<Signals>,
 }
 
 enum Next<E> {
@@ -67,7 +103,7 @@ enum Failure {
 }
 
 struct Loop<E, A, S, F> {
-    rt: StrategyRuntime<E, A>,
+    env: Env<A>,
     handler: Handler<E, A, S>,
     factory: Option<F>,
     restarts: VecDeque<Instant>,
@@ -94,30 +130,58 @@ pub(crate) async fn run_strategy<E, A, S, F>(
     F: FnMut() -> S + Send + 'static,
 {
     let span = tracing::info_span!("strategy", name = %rt.name);
-    let ctx = rt.new_ctx();
-    let label = [("strategy", &*rt.name)];
+    let on_error = rt.on_error;
+    let (inbox, env) = rt.split();
+    let label = [("strategy", &*env.name)];
     let handler = Handler {
         strategy: first,
-        ctx,
-        on_error: rt.on_error,
+        ctx: env.new_ctx(),
+        on_error,
         handle_time: obs::histogram(obs::EVENT_HANDLE, &label),
         _event: PhantomData,
     };
     let mut this = Loop {
         restart_counter: obs::counter(obs::RESTARTS, &label),
-        rt,
+        env,
         handler,
         factory,
         restarts: VecDeque::new(),
     };
-    this.run(ready).instrument(span).await;
+    this.run(inbox, ready).instrument(span).await;
 }
 
-impl<E, A> StrategyRuntime<E, A>
-where
-    E: Send + Sync + 'static,
-    A: Send + Sync + 'static,
-{
+impl<E, A> StrategyRuntime<E, A> {
+    fn split(self) -> (Inbox<E>, Env<A>) {
+        let inbox = Inbox {
+            index: self.index,
+            lossless: self.lossless,
+            drop_newest: self.drop_newest,
+            broadcasts: self.broadcasts,
+            watches: self.watches,
+            system: self.system,
+            wake: self.wake,
+            signals: Arc::clone(&self.signals),
+            shared: Arc::clone(&self.shared),
+            stop: Box::pin(self.shared.strategies_stop.clone().cancelled_owned()),
+            rotation: 0,
+            side: None,
+        };
+        let env = Env {
+            index: self.index,
+            name: self.name,
+            on_panic: self.on_panic,
+            max_tasks: self.max_tasks,
+            router: self.router,
+            notifier: self.notifier,
+            shared: self.shared,
+            fatal: self.fatal,
+            signals: self.signals,
+        };
+        (inbox, env)
+    }
+}
+
+impl<A: Send + Sync + 'static> Env<A> {
     fn new_ctx(&self) -> StrategyCtx<A> {
         StrategyCtx {
             actions: ActionSender::new(Arc::clone(&self.router)),
@@ -133,13 +197,37 @@ where
             notifier: self.notifier.clone(),
         }
     }
+}
 
-    fn poll_next(
-        &mut self,
-        cx: &mut Context<'_>,
-        stop: Pin<&mut WaitForCancellationFutureOwned>,
-    ) -> Poll<Next<E>> {
-        if stop.poll(cx).is_ready() {
+impl<E> Stream for Inbox<E> {
+    type Item = Msg<E>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Msg<E>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(msg) = this.next_side() {
+                this.set_idle(false);
+                return Poll::Ready(Some(msg));
+            }
+            match this.poll_queues(cx) {
+                Poll::Pending => {
+                    this.set_idle(this.is_empty());
+                    return Poll::Pending;
+                }
+                Poll::Ready(Next::Stop) => return Poll::Ready(None),
+                Poll::Ready(Next::Msg(msg)) => {
+                    this.set_idle(false);
+                    return Poll::Ready(Some(msg));
+                }
+                Poll::Ready(Next::Wake) => this.side = Some(Side::Dropped(0)),
+            }
+        }
+    }
+}
+
+impl<E> Inbox<E> {
+    fn poll_queues(&mut self, cx: &mut Context<'_>) -> Poll<Next<E>> {
+        if self.stop.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Next::Stop);
         }
         let start = self.rotation;
@@ -160,6 +248,22 @@ where
             .map_or(Poll::Pending, Poll::Ready)
     }
 
+    /// What is still queued once strategies are stopped, without waiting for more.
+    fn remaining(&mut self) -> impl Iterator<Item = Msg<E>> + '_ {
+        iter::from_fn(|| {
+            loop {
+                if let Some(msg) = self.next_side().or_else(|| self.try_next_queued()) {
+                    return Some(msg);
+                }
+                if self.is_empty() {
+                    return None;
+                }
+                let _ = self.wake.try_recv();
+                self.side = Some(Side::Dropped(0));
+            }
+        })
+    }
+
     fn try_next_queued(&mut self) -> Option<Msg<E>> {
         self.system.try_recv().ok().map(Msg::System).or_else(|| {
             [&mut self.lossless, &mut self.drop_newest]
@@ -169,29 +273,62 @@ where
         })
     }
 
-    fn side(&mut self) -> impl Iterator<Item = Msg<E>> {
-        let signals = &*self.signals;
-        let broadcasts = self
-            .broadcasts
-            .iter_mut()
-            .flat_map(move |b| iter::from_fn(move || b.try_recv(signals)).take(SIDE_BUDGET));
-        let latest = self
-            .watches
-            .iter_mut()
-            .filter_map(|w| match w.has_changed() {
-                Ok(true) => w.borrow_and_update().clone(),
-                _ => None,
-            })
-            .map(Msg::Event);
-        signals
-            .take()
-            .map(Msg::System)
-            .chain(broadcasts)
-            .chain(latest)
+    fn next_side(&mut self) -> Option<Msg<E>> {
+        while let Some(step) = self.side {
+            let (msg, next) = self.side_step(step);
+            self.side = next;
+            if msg.is_some() {
+                return msg;
+            }
+        }
+        None
+    }
+
+    fn side_step(&mut self, step: Side) -> (Option<Msg<E>>, Option<Side>) {
+        match step {
+            Side::Dropped(slot) if slot < self.signals.slots.len() => (
+                self.signals.take_dropped(slot).map(Msg::System),
+                Some(Side::Lagging(slot)),
+            ),
+            Side::Dropped(_) => (None, Some(Side::Broadcast(0, SIDE_BUDGET))),
+            Side::Lagging(slot) => (
+                self.signals.take_lagging(slot).map(Msg::System),
+                Some(Side::Dropped(slot + 1)),
+            ),
+            Side::Broadcast(index, budget) if index < self.broadcasts.len() => {
+                let msg = (budget > 0)
+                    .then(|| self.broadcasts[index].try_recv(&self.signals))
+                    .flatten();
+                let next = match msg {
+                    Some(_) => Side::Broadcast(index, budget - 1),
+                    None => Side::Broadcast(index + 1, SIDE_BUDGET),
+                };
+                (msg, Some(next))
+            }
+            Side::Broadcast(..) => (None, Some(Side::Watch(0))),
+            Side::Watch(index) if index < self.watches.len() => {
+                (self.latest(index), Some(Side::Watch(index + 1)))
+            }
+            Side::Watch(_) => {
+                if self.broadcasts.iter().any(|b| !b.rx.is_empty()) {
+                    self.signals.wake();
+                }
+                (None, None)
+            }
+        }
+    }
+
+    fn latest(&mut self, index: usize) -> Option<Msg<E>> {
+        let watch = &mut self.watches[index];
+        match watch.has_changed() {
+            Ok(true) => watch.borrow_and_update().clone().map(Msg::Event),
+            _ => None,
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.system.is_empty()
+        self.side.is_none()
+            && self.system.is_empty()
             && self.lossless.as_ref().is_none_or(|rx| rx.is_empty())
             && self.drop_newest.as_ref().is_none_or(|rx| rx.is_empty())
             && self.broadcasts.iter().all(|b| b.rx.is_empty())
@@ -303,64 +440,44 @@ where
     S: Strategy<E, A>,
     F: FnMut() -> S + Send + 'static,
 {
-    async fn run(&mut self, ready: oneshot::Sender<bool>) {
+    async fn run(&mut self, mut inbox: Inbox<E>, ready: oneshot::Sender<bool>) {
         let init = self.handler.init().await;
         let init_failure = match init {
             Ok(Ok(())) => None,
             Ok(Err(err)) => Some(ExitReason::StrategyFailed {
-                strategy: self.rt.name.to_string(),
+                strategy: self.env.name.to_string(),
                 error: err.to_string(),
             }),
             Err(message) => Some(ExitReason::StrategyPanicked {
-                strategy: self.rt.name.to_string(),
+                strategy: self.env.name.to_string(),
                 message,
             }),
         };
         if let Some(reason) = init_failure {
             tracing::error!(%reason, "init failed");
-            let _ = self.rt.fatal.send(reason);
+            let _ = self.env.fatal.send(reason);
             let _ = ready.send(false);
             return;
         }
         let _ = ready.send(true);
 
-        let mut stop = Box::pin(self.rt.shared.strategies_stop.clone().cancelled_owned());
-        loop {
-            self.rt.set_idle(self.rt.is_empty());
-            let next = std::future::poll_fn(|cx| self.rt.poll_next(cx, stop.as_mut())).await;
-            self.rt.set_idle(false);
-            let result = match next {
-                Next::Stop => break,
-                Next::Msg(msg) => self.handler.dispatch(msg).await,
-                Next::Wake => self.drain_side().await,
-            };
-            if let Err(failure) = result
-                && !self.recover(failure).await
-            {
+        while let Some(msg) = inbox.next().await {
+            if !self.handle(msg).await {
                 return;
             }
         }
-        self.shutdown().await;
+        self.shutdown(&mut inbox).await;
     }
 
-    async fn shutdown(&mut self) {
-        let deadline = self.rt.shared.deadline();
+    async fn shutdown(&mut self, inbox: &mut Inbox<E>) {
+        let deadline = self.env.shared.deadline();
         let drained = tokio::time::timeout_at(deadline, async {
-            loop {
-                let result = match self.rt.try_next_queued() {
-                    Some(msg) => self.handler.dispatch(msg).await,
-                    None if !self.rt.is_empty() => {
-                        let _ = self.rt.wake.try_recv();
-                        self.drain_side().await
-                    }
-                    None => return true,
-                };
-                if let Err(failure) = result
-                    && !self.recover(failure).await
-                {
+            for msg in inbox.remaining() {
+                if !self.handle(msg).await {
                     return false;
                 }
             }
+            true
         })
         .await;
         match drained {
@@ -373,17 +490,15 @@ where
             self.handler.on_system(&SystemEvent::ShutdownRequested),
         )
         .await;
-        self.rt.set_idle(true);
+        inbox.set_idle(true);
     }
 
-    async fn drain_side(&mut self) -> Result<(), Failure> {
-        for msg in self.rt.side() {
-            self.handler.dispatch(msg).await?;
+    /// Returns `false` if the strategy loop has to end.
+    async fn handle(&mut self, msg: Msg<E>) -> bool {
+        match self.handler.dispatch(msg).await {
+            Ok(()) => true,
+            Err(failure) => self.recover(failure).await,
         }
-        if self.rt.broadcasts.iter().any(|b| !b.rx.is_empty()) {
-            self.rt.signals.wake();
-        }
-        Ok(())
     }
 
     async fn announce_restart(&mut self, reason: &str) -> Result<(), Failure> {
@@ -391,7 +506,7 @@ where
             reason: reason.to_owned(),
         };
         let gaps = self
-            .rt
+            .env
             .signals
             .slots
             .iter()
@@ -408,11 +523,11 @@ where
 
     /// Returns `false` if the strategy loop has to end.
     async fn recover(&mut self, failure: Failure) -> bool {
-        let name = self.rt.name.to_string();
+        let name = self.env.name.to_string();
         let mut reason = match failure {
             Failure::Error(error) => {
                 tracing::error!(%error, "handler failed, aborting");
-                let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
+                let _ = self.env.fatal.send(ExitReason::StrategyFailed {
                     strategy: name,
                     error,
                 });
@@ -420,11 +535,11 @@ where
             }
             Failure::Panic(message) => message,
         };
-        let (max, within) = match (self.rt.on_panic, self.factory.is_some()) {
+        let (max, within) = match (self.env.on_panic, self.factory.is_some()) {
             (OnPanic::Restart { max, within }, true) => (max, within),
             _ => {
                 tracing::error!(panic = %reason, "strategy panicked, aborting");
-                let _ = self.rt.fatal.send(ExitReason::StrategyPanicked {
+                let _ = self.env.fatal.send(ExitReason::StrategyPanicked {
                     strategy: name,
                     message: reason,
                 });
@@ -437,7 +552,7 @@ where
             if self.restarts.len() >= max as usize {
                 tracing::error!(panic = %reason, max, ?within, "restart limit exceeded");
                 let message = format!("{reason} (more than {max} restarts within {within:?})");
-                let _ = self.rt.fatal.send(ExitReason::StrategyPanicked {
+                let _ = self.env.fatal.send(ExitReason::StrategyPanicked {
                     strategy: name,
                     message,
                 });
@@ -447,12 +562,12 @@ where
             self.restart_counter.increment(1);
             tracing::warn!(panic = %reason, "strategy panicked, rebuilding");
             self.handler.ctx.tasks.token.cancel();
-            self.handler.ctx = self.rt.new_ctx();
+            self.handler.ctx = self.env.new_ctx();
             self.handler.strategy = (self.factory.as_mut().expect("checked above"))();
             match self.handler.init().await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
+                    let _ = self.env.fatal.send(ExitReason::StrategyFailed {
                         strategy: name,
                         error: err.to_string(),
                     });
@@ -464,13 +579,9 @@ where
                 }
             }
             match self.announce_restart(&reason).await {
-                Ok(()) => {
-                    // the panic may have interrupted a drain and left side work without a wake
-                    self.rt.signals.wake();
-                    return true;
-                }
+                Ok(()) => return true,
                 Err(Failure::Error(error)) => {
-                    let _ = self.rt.fatal.send(ExitReason::StrategyFailed {
+                    let _ = self.env.fatal.send(ExitReason::StrategyFailed {
                         strategy: name,
                         error,
                     });

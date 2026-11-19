@@ -41,23 +41,21 @@ impl Signals {
             .expect("slot exists for every subscribed source")
     }
 
-    pub(crate) fn take(&self) -> impl Iterator<Item = SystemEvent> + '_ {
-        self.slots.iter().flat_map(|slot| {
-            let dropped = slot.dropped.swap(0, Ordering::AcqRel);
-            let lagging = slot.lagging.swap(0, Ordering::AcqRel);
-            let source = &slot.source;
-            [
-                (dropped > 0).then(|| SystemEvent::Dropped {
-                    source: source.clone(),
-                    count: dropped,
-                }),
-                (lagging > 0).then(|| SystemEvent::Lagging {
-                    source: source.clone(),
-                    depth: lagging,
-                }),
-            ]
-            .into_iter()
-            .flatten()
+    pub(crate) fn take_dropped(&self, slot: usize) -> Option<SystemEvent> {
+        let slot = &self.slots[slot];
+        let count = slot.dropped.swap(0, Ordering::AcqRel);
+        (count > 0).then(|| SystemEvent::Dropped {
+            source: slot.source.clone(),
+            count,
+        })
+    }
+
+    pub(crate) fn take_lagging(&self, slot: usize) -> Option<SystemEvent> {
+        let slot = &self.slots[slot];
+        let depth = slot.lagging.swap(0, Ordering::AcqRel);
+        (depth > 0).then(|| SystemEvent::Lagging {
+            source: slot.source.clone(),
+            depth,
         })
     }
 

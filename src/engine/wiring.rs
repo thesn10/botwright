@@ -279,7 +279,6 @@ impl<E: Send + Sync + 'static> Wiring<E> {
             notifier: notifier.clone(),
             shared: Arc::clone(shared),
             fatal: fatal.clone(),
-            rotation: 0,
         }
     }
 }
