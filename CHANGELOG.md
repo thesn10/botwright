@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-19
+
 ### Fixed
 
 - After a strategy restart, `Dropped` and `Lagging` notices and `Latest` values left over from the
