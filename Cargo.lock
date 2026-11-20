@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "botwright"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 1.6.3",
  "alloy 2.6.1",
