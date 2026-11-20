@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, future, stream};
 
 use botwright::eth::{
     Address, B256, BlockCursor, Bytes, ChainEvent, DynProvider, Header, LogEvent, Provider,
@@ -14,8 +14,9 @@ use botwright::{
     Backoff, BoxError, CollectorOpts, Engine, EngineHandle, Envelope, ExitReason, Strategy,
     StrategyCtx, SystemEvent,
 };
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 
@@ -26,15 +27,6 @@ pub struct Anvil {
     pub port: u16,
 }
 
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 pub async fn anvil() -> Option<Anvil> {
     if std::env::var_os("RUST_LOG").is_some() {
         let _ = tracing_subscriber::fmt()
@@ -42,14 +34,13 @@ pub async fn anvil() -> Option<Anvil> {
             .try_init();
     }
     let bin = std::env::var("ANVIL").unwrap_or_else(|_| "anvil".into());
-    let port = free_port().await;
     let child = Command::new(&bin)
-        .args(["--port", &port.to_string(), "--silent"])
-        .stdout(Stdio::null())
+        .args(["--port", "0"])
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn();
-    let child = match child {
+    let mut child = match child {
         Ok(child) => child,
         Err(err) if std::env::var_os("BOTWRIGHT_REQUIRE_ANVIL").is_some() => {
             panic!("cannot start `{bin}`: {err}")
@@ -59,20 +50,40 @@ pub async fn anvil() -> Option<Anvil> {
             return None;
         }
     };
-    let up = stream::iter(0..100)
-        .any(|_| async move {
-            let up = TcpStream::connect(("127.0.0.1", port)).await.is_ok();
-            if !up {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            up
-        })
-        .await;
-    assert!(up, "anvil did not start");
+
+    let mut stdout = Box::pin(lines(child.stdout.take().expect("piped stdout")));
+    let mut ports = stdout
+        .by_ref()
+        .filter_map(|line| future::ready(listening_port(&line)));
+    let port = tokio::time::timeout(Duration::from_secs(10), ports.next())
+        .await
+        .ok()
+        .flatten()
+        .expect("anvil did not start");
+
+    // anvil logs every request to stdout and stalls once the pipe is full.
+    tokio::spawn(stdout.for_each(|_| future::ready(())));
+
     Some(Anvil {
         _child: child,
         port,
     })
+}
+
+fn lines(stdout: ChildStdout) -> impl Stream<Item = String> {
+    stream::unfold(BufReader::new(stdout).lines(), |mut lines| async move {
+        lines
+            .next_line()
+            .await
+            .ok()
+            .flatten()
+            .map(|line| (line, lines))
+    })
+}
+
+fn listening_port(line: &str) -> Option<u16> {
+    let addr: SocketAddr = line.strip_prefix("Listening on ")?.trim().parse().ok()?;
+    Some(addr.port())
 }
 
 impl Anvil {
