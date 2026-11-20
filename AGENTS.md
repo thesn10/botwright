@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents when working with code in this repository.
 
 Rust crate (edition 2024, MSRV 1.90) for event-driven bots: collector → strategy → executor (Artemis pattern). Public API, rustdoc and docs are in English (crates.io). `docs/guarantees.md` is a contract: changing behaviour described there needs a test and a CHANGELOG entry.
 
