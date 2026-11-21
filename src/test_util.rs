@@ -3,8 +3,8 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,15 +37,33 @@ pub enum Pace {
     Original,
     /// Original spacing divided by the factor.
     Speedup(f64),
+    /// Original spacing with each inter-event gap clamped to `max_gap`.
+    ///
+    /// Keeps realistic sub-block and multi-block timing without burning virtual time across
+    /// multi-hour or multi-day idle gaps.
+    Capped {
+        /// Maximum virtual wait between any two consecutive records.
+        max_gap: Duration,
+    },
 }
 
-/// Emits a fixed sequence of events. The cursor is the index of the next event, so a reconnect
-/// continues where the stream broke off. Exhausted after the last event.
+type RecordIter<E> = Box<dyn Iterator<Item = Result<Record<E>, CollectorError>> + Send>;
+type StreamFactory<E> =
+    Arc<dyn Fn(usize) -> Result<RecordIter<E>, CollectorError> + Send + Sync>;
+
+enum ReplaySource<E> {
+    Memory(Arc<Vec<Record<E>>>),
+    Stream(StreamFactory<E>),
+}
+
+/// Emits a fixed or streamed sequence of events. The cursor is the index of the next event, so a
+/// reconnect continues where the stream broke off. Exhausted after the last event.
 pub struct ReplayCollector<E> {
     name: String,
-    events: Arc<Vec<Record<E>>>,
+    source: ReplaySource<E>,
     pace: Pace,
     position: Arc<AtomicUsize>,
+    exhausted: Arc<AtomicBool>,
 }
 
 impl<E> ReplayCollector<E> {
@@ -71,16 +89,39 @@ impl<E> ReplayCollector<E> {
         )
     }
 
-    /// Records as written by [`RecordingCollector`].
+    /// Records as written by [`RecordingCollector`], held in memory.
     pub fn from_records(
         name: impl Into<String>,
         records: impl IntoIterator<Item = Record<E>>,
     ) -> Self {
+        let events: Vec<Record<E>> = records.into_iter().collect();
+        let empty = events.is_empty();
         Self {
             name: name.into(),
-            events: Arc::new(records.into_iter().collect()),
+            source: ReplaySource::Memory(Arc::new(events)),
             pace: Pace::default(),
             position: Arc::new(AtomicUsize::new(0)),
+            exhausted: Arc::new(AtomicBool::new(empty)),
+        }
+    }
+
+    /// Streams records lazily on demand from `factory`, avoiding loading large tapes into memory.
+    ///
+    /// `factory` receives the resume index (0 on initial connect) and returns an iterator starting
+    /// at that record.
+    pub fn from_stream<F, I>(name: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn(usize) -> Result<I, CollectorError> + Send + Sync + 'static,
+        I: Iterator<Item = Result<Record<E>, CollectorError>> + Send + 'static,
+    {
+        let boxed: StreamFactory<E> =
+            Arc::new(move |start| Ok(Box::new(factory(start)?) as RecordIter<E>));
+        Self {
+            name: name.into(),
+            source: ReplaySource::Stream(boxed),
+            pace: Pace::default(),
+            position: Arc::new(AtomicUsize::new(0)),
+            exhausted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -90,19 +131,30 @@ impl<E> ReplayCollector<E> {
         self
     }
 
-    /// Number of events.
+    /// Number of events for in-memory sources; returns `0` for streaming sources.
     pub fn len(&self) -> usize {
-        self.events.len()
+        match &self.source {
+            ReplaySource::Memory(events) => events.len(),
+            ReplaySource::Stream(_) => 0,
+        }
     }
 
-    /// Whether there are no events.
+    /// Whether an in-memory source has no events; returns `false` for streaming sources.
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        match &self.source {
+            ReplaySource::Memory(events) => events.is_empty(),
+            ReplaySource::Stream(_) => false,
+        }
+    }
+
+    /// Whether this collector streams records lazily instead of holding them in memory.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.source, ReplaySource::Stream(_))
     }
 }
 
 impl<E: DeserializeOwned> ReplayCollector<E> {
-    /// Reads a JSONL file of [`Record`]s.
+    /// Reads a JSONL file of [`Record`]s into memory.
     pub fn from_jsonl(name: impl Into<String>, path: impl AsRef<Path>) -> io::Result<Self> {
         let records = BufReader::new(File::open(path)?)
             .lines()
@@ -110,6 +162,49 @@ impl<E: DeserializeOwned> ReplayCollector<E> {
             .map(|line| serde_json::from_str(&line?).map_err(io::Error::other))
             .collect::<io::Result<Vec<_>>>()?;
         Ok(Self::from_records(name, records))
+    }
+}
+
+impl<E: DeserializeOwned + Send + Sync + 'static> ReplayCollector<E> {
+    /// Streams a JSONL file of [`Record`]s line-by-line in O(1) memory.
+    pub fn stream_jsonl(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        Self::from_stream(name, move |start| {
+            let file = File::open(&path).map_err(CollectorError::other)?;
+            Ok(BufReader::new(file)
+                .lines()
+                .filter(|line| line.as_ref().map_or(true, |l| !l.trim().is_empty()))
+                .skip(start)
+                .map(|line| {
+                    let raw = line.map_err(CollectorError::other)?;
+                    serde_json::from_str::<Record<E>>(&raw)
+                        .map_err(|err| CollectorError::protocol(err.to_string()))
+                }))
+        })
+    }
+}
+
+struct ReplayState<E> {
+    iter: RecordIter<E>,
+    index: usize,
+    prev_at_ms: Option<u64>,
+    elapsed: Duration,
+    base: Instant,
+    pace: Pace,
+    position: Arc<AtomicUsize>,
+    exhausted: Arc<AtomicBool>,
+}
+
+fn step_delay(pace: Pace, prev_at_ms: Option<u64>, cur_at_ms: u64) -> Duration {
+    let Some(prev) = prev_at_ms else {
+        return Duration::ZERO;
+    };
+    let delta = Duration::from_millis(cur_at_ms.saturating_sub(prev));
+    match pace {
+        Pace::AsFastAsPossible => Duration::ZERO,
+        Pace::Original => delta,
+        Pace::Speedup(factor) => delta.div_f64(factor.max(f64::MIN_POSITIVE)),
+        Pace::Capped { max_gap } => delta.min(max_gap),
     }
 }
 
@@ -128,33 +223,57 @@ impl<E: Clone + Send + Sync + 'static> Collector<E> for ReplayCollector<E> {
         CollectorError,
     > {
         let start = resume.unwrap_or(0);
-        let events = Arc::clone(&self.events);
-        let position = Arc::clone(&self.position);
-        let pace = self.pace;
-        let base = Instant::now();
-        let origin = events.get(start).map_or(0, |r| r.at_ms);
-        Ok(stream::unfold(start, move |index| {
-            let events = Arc::clone(&events);
-            let position = Arc::clone(&position);
-            async move {
-                let record = events.get(index)?;
-                let offset = Duration::from_millis(record.at_ms.saturating_sub(origin));
-                let wait = match pace {
-                    Pace::AsFastAsPossible => None,
-                    Pace::Original => Some(offset),
-                    Pace::Speedup(factor) => Some(offset.div_f64(factor.max(f64::MIN_POSITIVE))),
-                };
-                if let Some(wait) = wait {
-                    tokio::time::sleep_until(base + wait).await;
-                }
-                position.store(index + 1, Ordering::Release);
-                Some((Ok(Item::new(record.event.clone(), index + 1)), index + 1))
+        let iter: RecordIter<E> = match &self.source {
+            ReplaySource::Memory(events) => {
+                let events = Arc::clone(events);
+                Box::new((start..events.len()).map(move |i| Ok(events[i].clone())))
             }
+            ReplaySource::Stream(factory) => factory(start)?,
+        };
+
+        let state = ReplayState {
+            iter,
+            index: start,
+            prev_at_ms: None,
+            elapsed: Duration::ZERO,
+            base: Instant::now(),
+            pace: self.pace,
+            position: Arc::clone(&self.position),
+            exhausted: Arc::clone(&self.exhausted),
+        };
+
+        Ok(stream::unfold(state, |mut st| async move {
+            let next = match st.iter.next() {
+                Some(Ok(record)) => record,
+                Some(Err(err)) => return Some((Err(err), st)),
+                None => {
+                    st.exhausted.store(true, Ordering::Release);
+                    return None;
+                }
+            };
+
+            let delay = step_delay(st.pace, st.prev_at_ms, next.at_ms);
+            st.prev_at_ms = Some(next.at_ms);
+            if !delay.is_zero() {
+                st.elapsed += delay;
+                tokio::time::sleep_until(st.base + st.elapsed).await;
+            }
+
+            let next_index = st.index + 1;
+            st.index = next_index;
+            st.position.store(next_index, Ordering::Release);
+            Some((Ok(Item::new(next.event, next_index)), st))
         }))
     }
 
     fn is_exhausted(&self) -> bool {
-        self.position.load(Ordering::Acquire) >= self.events.len()
+        if self.exhausted.load(Ordering::Acquire) {
+            return true;
+        }
+        match &self.source {
+            ReplaySource::Memory(events) => self.position.load(Ordering::Acquire) >= events.len(),
+            ReplaySource::Stream(_) => false,
+        }
     }
 }
 
