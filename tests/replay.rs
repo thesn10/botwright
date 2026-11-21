@@ -58,8 +58,9 @@ impl Strategy<Event, Action> for Bidder {
     }
 }
 
-fn recording_file() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("botwright-replay-{}.jsonl", std::process::id()));
+fn recording_file(tag: &str) -> PathBuf {
+    let path =
+        std::env::temp_dir().join(format!("botwright-replay-{}-{tag}.jsonl", std::process::id()));
     let lines: String = (0..300u64)
         .map(|i| {
             let event = if i % 10 == 0 {
@@ -102,7 +103,7 @@ fn run(path: &PathBuf) -> HarnessReport<Action> {
 
 #[test]
 fn same_recording_yields_the_same_actions() {
-    let path = recording_file();
+    let path = recording_file("deterministic");
     let first = run(&path);
     let second = run(&path);
     std::fs::remove_file(&path).ok();
@@ -135,4 +136,111 @@ fn recording_writes_replayable_jsonl() {
     let replayed = ReplayCollector::<Event>::from_jsonl("again", &path).unwrap();
     std::fs::remove_file(&path).ok();
     assert_eq!(replayed.len(), 2);
+}
+
+#[test]
+fn stream_jsonl_matches_in_memory_replay() {
+    let path = recording_file("stream");
+    let in_memory = Harness::new(
+        Engine::<Event, Action>::builder()
+            .collector(
+                ReplayCollector::<Event>::from_jsonl("prices", &path)
+                    .unwrap()
+                    .pace(Pace::Original),
+                CollectorOpts::default(),
+            )
+            .strategy(Bidder::default(), |s| {
+                s.from("prices", Delivery::Lossless { capacity: 16 })
+            }),
+    )
+    .run();
+
+    let streamed = Harness::new(
+        Engine::<Event, Action>::builder()
+            .collector(
+                ReplayCollector::<Event>::stream_jsonl("prices", &path).pace(Pace::Original),
+                CollectorOpts::default(),
+            )
+            .strategy(Bidder::default(), |s| {
+                s.from("prices", Delivery::Lossless { capacity: 16 })
+            }),
+    )
+    .run();
+    std::fs::remove_file(&path).ok();
+
+    assert!(in_memory.completed && streamed.completed);
+    assert_eq!(in_memory.actions, streamed.actions);
+    assert_eq!(in_memory.elapsed, streamed.elapsed);
+}
+
+#[test]
+fn pace_capped_clamps_large_gaps_without_burning_virtual_time() {
+    let records = vec![
+        Record {
+            at_ms: 0,
+            event: Event::Block(1),
+        },
+        Record {
+            at_ms: 100,
+            event: Event::Block(2),
+        },
+        Record {
+            // 10-hour gap should be clamped to 1s.
+            at_ms: 100 + 10 * 3_600 * 1_000,
+            event: Event::Block(3),
+        },
+    ];
+    let collector = ReplayCollector::from_records("blocks", records).pace(Pace::Capped {
+        max_gap: Duration::from_secs(1),
+    });
+
+    let report = Harness::new(
+        Engine::<Event, Action>::builder()
+            .collector(collector, CollectorOpts::default())
+            .strategy(Bidder::default(), |s| s.from("blocks", Delivery::default())),
+    )
+    .run();
+
+    assert!(report.completed);
+    assert_eq!(report.actions.len(), 3);
+    assert!(report.elapsed >= Duration::from_millis(1_100));
+    assert!(report.elapsed < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn from_stream_supports_cursor_resume() {
+    use botwright::{Collector, Item};
+    use futures::TryStreamExt;
+
+    let collector = ReplayCollector::from_stream("stream", |start| {
+        Ok((start..5usize).map(|i| {
+            Ok(Record {
+                at_ms: (i as u64) * 10,
+                event: Event::Block(i as u64),
+            })
+        }))
+    });
+    assert!(collector.is_streaming());
+    assert!(!collector.is_exhausted());
+
+    let items: Vec<Item<Event, usize>> = collector
+        .connect(Some(2))
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert!(collector.is_exhausted());
+    let blocks: Vec<u64> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Event {
+                event: Event::Block(n),
+                ..
+            } => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, vec![2, 3, 4]);
 }
