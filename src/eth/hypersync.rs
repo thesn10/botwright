@@ -383,7 +383,13 @@ mod tests {
 
     #[test]
     fn query_respects_custom_log_fields() {
-        let q = query(&Filter::new(), 10, 20, Some(&[LogField::Address, LogField::Data])).unwrap();
+        let q = query(
+            &Filter::new(),
+            10,
+            20,
+            Some(&[LogField::Address, LogField::Data]),
+        )
+        .unwrap();
         assert!(q.field_selection.log.contains(&LogField::Address));
         assert!(q.field_selection.log.contains(&LogField::Data));
         assert!(!q.field_selection.log.contains(&LogField::BlockHash));

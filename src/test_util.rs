@@ -48,8 +48,7 @@ pub enum Pace {
 }
 
 type RecordIter<E> = Box<dyn Iterator<Item = Result<Record<E>, CollectorError>> + Send>;
-type StreamFactory<E> =
-    Arc<dyn Fn(usize) -> Result<RecordIter<E>, CollectorError> + Send + Sync>;
+type StreamFactory<E> = Arc<dyn Fn(usize) -> Result<RecordIter<E>, CollectorError> + Send + Sync>;
 
 enum ReplaySource<E> {
     Memory(Arc<Vec<Record<E>>>),

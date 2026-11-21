@@ -59,8 +59,10 @@ impl Strategy<Event, Action> for Bidder {
 }
 
 fn recording_file(tag: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("botwright-replay-{}-{tag}.jsonl", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "botwright-replay-{}-{tag}.jsonl",
+        std::process::id()
+    ));
     let lines: String = (0..300u64)
         .map(|i| {
             let event = if i % 10 == 0 {
