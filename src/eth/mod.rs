@@ -46,6 +46,11 @@ pub use blocks::{
 pub use bundle::{Bundle, BundleAction, BundleExecutor};
 #[cfg(feature = "hypersync")]
 pub use hypersync::HyperSyncBackfill;
+#[cfg(feature = "hypersync")]
+pub use hypersync_client::{
+    StreamConfig as HyperSyncStreamConfig, StreamMetrics as HyperSyncStreamMetrics,
+    StreamObserver as HyperSyncStreamObserver, net_types::LogField as HyperSyncLogField,
+};
 pub use logs::{LogBackfill, LogCollector, LogCursor, LogEvent, RpcBackfill};
 #[cfg(feature = "mempool")]
 pub use mempool::{MempoolCollector, PendingTransaction};

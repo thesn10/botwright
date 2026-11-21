@@ -3,11 +3,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use hypersync_client::net_types::{BlockField, LogField, LogFilter, Query};
-use hypersync_client::{QueryResponse, StreamConfig, simple_types};
+use hypersync_client::{QueryResponse, StreamConfig, StreamObserver, simple_types};
 use itertools::Itertools;
 
 use super::alloy::network::Network;
@@ -24,6 +25,8 @@ use crate::CollectorError;
 pub struct HyperSyncBackfill {
     client: Arc<hypersync_client::Client>,
     config: StreamConfig,
+    log_fields: Option<Vec<LogField>>,
+    observer: Option<Arc<dyn StreamObserver>>,
     rpc: RpcBackfill,
 }
 
@@ -41,6 +44,8 @@ impl HyperSyncBackfill {
         Self {
             client: Arc::new(client),
             config: StreamConfig::default(),
+            log_fields: None,
+            observer: None,
             rpc: RpcBackfill::default(),
         }
     }
@@ -63,8 +68,49 @@ impl HyperSyncBackfill {
 
     /// Concurrency, batch sizes and look-ahead buffer of the HyperSync stream; the default is
     /// [`StreamConfig::default`].
+    ///
+    /// Note that `StreamConfig::default()` uses `concurrency = 10`, which bursts free-tier rate
+    /// limits (e.g. 15 req/min). Prefer [`Self::sequential`] when rate-limited.
     pub fn stream_config(mut self, config: StreamConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Streams one full-range request at a time (`concurrency = 1`), letting HyperSync fill each
+    /// response page up to the server limit without parallel burst 429s.
+    pub fn sequential(mut self) -> Self {
+        self.config.concurrency = 1;
+        self
+    }
+
+    /// Selects which log fields HyperSync returns; defaults to [`LogField::all`].
+    ///
+    /// `Address`, `BlockNumber` and `LogIndex` are always included because log conversion and
+    /// ordering require them.
+    pub fn log_fields(mut self, fields: impl IntoIterator<Item = LogField>) -> Self {
+        self.log_fields = Some(with_required_fields(fields));
+        self
+    }
+
+    /// Requests only the fields needed for ABI decoding and ordering (`Address`, `Topic0`–`Topic3`,
+    /// `Data`, `BlockNumber`, `LogIndex`), omitting `BlockHash`, `TransactionHash`,
+    /// `TransactionIndex` and `Removed` to pack more logs into each HyperSync page.
+    pub fn minimal_log_fields(self) -> Self {
+        self.log_fields([
+            LogField::Address,
+            LogField::Topic0,
+            LogField::Topic1,
+            LogField::Topic2,
+            LogField::Topic3,
+            LogField::Data,
+            LogField::BlockNumber,
+            LogField::LogIndex,
+        ])
+    }
+
+    /// Reports per-request and progress metrics from the HyperSync stream to `observer`.
+    pub fn observer(mut self, observer: Arc<dyn StreamObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -82,19 +128,15 @@ impl HyperSyncBackfill {
             .await
             .map_err(CollectorError::transport)?
             .min(to + 1);
-        let receiver = if from < indexed_end {
-            let query = query(&filter, from, indexed_end)?;
-            let receiver = self.client.stream(query, self.config.clone()).await;
-            Some(receiver.map_err(CollectorError::transport)?)
-        } else {
-            None
-        };
-        let indexed = stream::unfold(receiver, |receiver| async move {
-            let mut receiver = receiver?;
-            let response = receiver.recv().await?;
-            let page = response.map_err(CollectorError::transport).and_then(page);
-            Some((page, Some(receiver)))
-        });
+
+        let indexed: Pin<Box<dyn Stream<Item = Result<Vec<Log>, CollectorError>> + Send>> =
+            if from < indexed_end {
+                let query = query(&filter, from, indexed_end, self.log_fields.as_deref())?;
+                self.open_stream(query).await?
+            } else {
+                Box::pin(stream::empty())
+            };
+
         let rest = <RpcBackfill as LogBackfill<N>>::pages(
             Arc::new(self.rpc),
             provider,
@@ -104,14 +146,75 @@ impl HyperSyncBackfill {
         );
         Ok(indexed.chain(rest))
     }
+
+    async fn open_stream(
+        &self,
+        query: Query,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<Log>, CollectorError>> + Send>>, CollectorError>
+    {
+        match &self.observer {
+            Some(observer) => {
+                let rx = self
+                    .client
+                    .stream_arrow_with_observer(query, self.config.clone(), Arc::clone(observer))
+                    .await
+                    .map_err(CollectorError::transport)?;
+                Ok(Box::pin(stream::unfold(rx, |mut rx| async move {
+                    let res = rx.recv().await?;
+                    let page = res
+                        .map_err(CollectorError::transport)
+                        .and_then(|arrow| {
+                            QueryResponse::try_from(&arrow)
+                                .map_err(|err| CollectorError::protocol(err.to_string()))
+                        })
+                        .and_then(page);
+                    Some((page, rx))
+                })))
+            }
+            None => {
+                let rx = self
+                    .client
+                    .stream(query, self.config.clone())
+                    .await
+                    .map_err(CollectorError::transport)?;
+                Ok(Box::pin(stream::unfold(rx, |mut rx| async move {
+                    let res = rx.recv().await?;
+                    let page = res.map_err(CollectorError::transport).and_then(page);
+                    Some((page, rx))
+                })))
+            }
+        }
+    }
 }
 
-fn query(filter: &Filter, from: u64, to_excl: u64) -> Result<Query, CollectorError> {
+fn with_required_fields(fields: impl IntoIterator<Item = LogField>) -> Vec<LogField> {
+    let required = [LogField::Address, LogField::BlockNumber, LogField::LogIndex];
+    fields
+        .into_iter()
+        .chain(required)
+        .fold(Vec::new(), |mut acc, field| {
+            if !acc.contains(&field) {
+                acc.push(field);
+            }
+            acc
+        })
+}
+
+fn query(
+    filter: &Filter,
+    from: u64,
+    to_excl: u64,
+    log_fields: Option<&[LogField]>,
+) -> Result<Query, CollectorError> {
+    let selected: Vec<LogField> = log_fields.map_or_else(
+        || LogField::all().into_iter().collect(),
+        |fields| fields.to_vec(),
+    );
     Ok(Query::new()
         .from_block(from)
         .to_block_excl(to_excl)
         .where_logs(log_filter(filter)?)
-        .select_log_fields(LogField::all())
+        .select_log_fields(selected)
         .select_block_fields([BlockField::Number, BlockField::Timestamp]))
 }
 
@@ -266,5 +369,23 @@ mod tests {
                 (Some(8), Some(0), Some(1_700_000_002)),
             ]
         );
+    }
+
+    #[test]
+    fn custom_log_fields_always_include_required_columns() {
+        let fields = with_required_fields([LogField::Data, LogField::Topic0]);
+        assert!(fields.contains(&LogField::Address));
+        assert!(fields.contains(&LogField::BlockNumber));
+        assert!(fields.contains(&LogField::LogIndex));
+        assert!(fields.contains(&LogField::Data));
+        assert!(!fields.contains(&LogField::BlockHash));
+    }
+
+    #[test]
+    fn query_respects_custom_log_fields() {
+        let q = query(&Filter::new(), 10, 20, Some(&[LogField::Address, LogField::Data])).unwrap();
+        assert!(q.field_selection.log.contains(&LogField::Address));
+        assert!(q.field_selection.log.contains(&LogField::Data));
+        assert!(!q.field_selection.log.contains(&LogField::BlockHash));
     }
 }

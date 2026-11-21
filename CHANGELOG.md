@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ReplayCollector::from_stream` and `ReplayCollector::stream_jsonl` stream recorded events lazily
+  in O(1) memory instead of loading the entire tape into RAM, preserving cursor resume.
+- `Pace::Capped { max_gap }` replays with original inter-event spacing while clamping large idle
+  gaps (e.g. multi-hour/multi-day gaps) to `max_gap`.
+- `HyperSyncBackfill::sequential` (`concurrency = 1` for rate-limited tiers),
+  `HyperSyncBackfill::log_fields` / `minimal_log_fields` for selecting HyperSync log columns, and
+  `HyperSyncBackfill::observer` for forwarding `hypersync_client::StreamObserver` metrics (re-exported
+  as `HyperSyncStreamConfig`, `HyperSyncLogField`, `HyperSyncStreamObserver`, `HyperSyncStreamMetrics`).
+
 ## [0.1.2] - 2026-11-20
 
 ### Added
