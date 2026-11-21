@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-21
+
 ### Added
 
 - `ReplayCollector::from_stream` and `ReplayCollector::stream_jsonl` stream recorded events lazily
