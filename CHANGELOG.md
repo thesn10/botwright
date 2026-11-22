@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-22
+
 ### Changed
 
 - `RpcBackfill` separates failures by cause. A rate-limited `eth_getLogs` (HTTP 429/503, JSON-RPC
