@@ -7,6 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: add non exhaustive attributes to structs and enums which might get new fields 
+  in the future
+
 ## [0.1.4] - 2026-11-22
 
 ### Changed

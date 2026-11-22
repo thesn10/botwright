@@ -6,6 +6,7 @@ use super::Shared;
 
 /// Health of one collector.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CollectorHealth {
     /// Collector name.
     pub name: String,

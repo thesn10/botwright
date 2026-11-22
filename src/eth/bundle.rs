@@ -13,6 +13,7 @@ use crate::{BoxError, Executor};
 /// A Flashbots-style bundle for `eth_sendBundle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Bundle {
     /// Signed transactions, EIP-2718 encoded, executed in this order.
     pub txs: Vec<Bytes>,

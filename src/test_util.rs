@@ -29,6 +29,7 @@ pub struct Record<E> {
 
 /// Replay speed of a [`ReplayCollector`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub enum Pace {
     /// No waiting between events.
     #[default]
@@ -413,6 +414,7 @@ impl<A: Send + Sync + 'static> Executor<A> for CapturingExecutor<A> {
 
 /// Outcome of a [`Harness`] run.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct HarnessReport<A> {
     /// Every submitted action, in order.
     pub actions: Vec<Arc<A>>,

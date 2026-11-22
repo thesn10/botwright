@@ -5,6 +5,7 @@ use crate::{BuildError, OnError, OnPanic, SourceId};
 
 /// How events of one subscription reach the strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Delivery {
     /// Never drops; a full channel makes the collector wait.
     Lossless {
@@ -54,6 +55,7 @@ impl Delivery {
 
 /// Behaviour of a `Lossless` subscription whose channel stays full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum OnFull {
     /// Wait as long as needed.
     #[default]

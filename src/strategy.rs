@@ -47,6 +47,7 @@ pub trait Strategy<E, A>: Send + 'static {
 
 /// What happens when `on_event` or `on_system` returns an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum OnError {
     /// Log, count and continue with the next event.
     #[default]
@@ -57,6 +58,7 @@ pub enum OnError {
 
 /// What happens when a strategy panics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum OnPanic {
     /// End the engine with [`ExitReason::StrategyPanicked`](crate::ExitReason::StrategyPanicked).
     #[default]
