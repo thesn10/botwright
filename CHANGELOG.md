@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `RpcBackfill` separates failures by cause. A rate-limited `eth_getLogs` (HTTP 429/503, JSON-RPC
+  code 429 or a rate-limit message) is retried with the same range after an exponential backoff
+  (1 s doubling up to 30 s, 8 times) instead of halving the range. Every other failure still halves
+  it. After four pages in a row succeed at a reduced range, the range doubles again, up to `max_range`.
+
 ## [0.1.3] - 2026-11-21
 
 ### Added

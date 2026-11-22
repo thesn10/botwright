@@ -2,10 +2,10 @@
 //! removals for blocks that left the canonical chain.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::future::{self, Future};
-use std::iter;
-use std::pin::{Pin, pin};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::{Stream, StreamExt, TryStream, TryStreamExt, stream};
 use itertools::Itertools;
@@ -18,6 +18,7 @@ use super::alloy::primitives::B256;
 use super::alloy::providers::{DynProvider, Provider};
 use super::alloy::pubsub::Subscription;
 use super::alloy::rpc::types::{Filter, Log};
+use super::alloy::transports::{RpcError, TransportErrorKind};
 use super::follower::{ChainItem, ChainOpts, Follower, Recent};
 use super::{ChainEvent, ProviderSource, transport};
 use crate::{Collector, CollectorError, Item};
@@ -89,8 +90,12 @@ pub trait LogBackfill<N: Network = Ethereum>: Send + Sync + 'static {
     }
 }
 
-/// Backfills with `eth_getLogs` in ranges of at most `max_range` blocks, halving the range when
-/// the node rejects a request.
+/// Backfills with `eth_getLogs` in ranges of at most `max_range` blocks.
+///
+/// A rate-limited request (HTTP 429 or 503, JSON-RPC code 429 or a rate-limit message) is retried
+/// with the same range after a backoff. Any other failure counts as a range the node rejects and
+/// halves the range. After a few pages in a row succeed at a reduced range, it doubles again, up to
+/// `max_range`.
 #[derive(Debug, Clone, Copy)]
 pub struct RpcBackfill {
     max_range: u64,
@@ -112,18 +117,49 @@ impl Default for RpcBackfill {
     }
 }
 
+/// Pages in a row that must succeed before a reduced range doubles; growing after every page would
+/// send every other request with a size the node just rejected.
+const GROW_AFTER: u32 = 4;
+/// Backoffs on rate limits for one page before its error is returned.
+const MAX_WAITS: u32 = 8;
+const FIRST_WAIT: Duration = Duration::from_secs(1);
+const MAX_WAIT: Duration = Duration::from_secs(30);
+
 struct RpcPages<N: Network> {
     provider: DynProvider<N>,
     filter: Filter,
     start: u64,
     to: u64,
     range: u64,
+    max_range: u64,
+    /// Pages in a row that succeeded at `range`.
+    streak: u32,
+}
+
+/// Why a request failed, which decides whether to wait or to shrink the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    RateLimited,
+    Rejected,
 }
 
 struct Attempt {
     range: u64,
     end: u64,
-    logs: Result<Vec<Log>, CollectorError>,
+    logs: Result<Vec<Log>, (Failure, CollectorError)>,
+}
+
+/// What to try after a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    Wait(Duration),
+    Halve,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    range: u64,
+    waits: u32,
 }
 
 impl<N: Network> RpcPages<N> {
@@ -132,22 +168,54 @@ impl<N: Network> RpcPages<N> {
             return Ok(None);
         }
 
-        let ranges = iter::successors(Some(self.range), |range| (*range > 1).then_some(range / 2));
-        let attempts = stream::iter(ranges)
-            .then(|range| self.fetch(range))
-            .skip_while(|attempt| future::ready(attempt.logs.is_err() && attempt.range > 1));
-        let attempt = pin!(attempts)
-            .next()
-            .await
-            .expect("a range of one block is always tried");
+        let attempt = self
+            .settle(Plan {
+                range: self.range,
+                waits: 0,
+            })
+            .await;
 
-        let logs = attempt.logs?;
+        let logs = attempt.logs.map_err(|(_, err)| err)?;
+        let streak = if attempt.range < self.range {
+            1
+        } else {
+            self.streak + 1
+        };
+        let (range, streak) = grown(attempt.range, streak, self.max_range);
         let rest = Self {
             start: attempt.end + 1,
-            range: attempt.range,
+            range,
+            streak,
             ..self
         };
         Ok(Some((logs, rest)))
+    }
+
+    /// Fetches one page, waiting out rate limits and halving rejected ranges, until it succeeds or
+    /// neither helps any more.
+    fn settle(&self, plan: Plan) -> Pin<Box<dyn Future<Output = Attempt> + Send + '_>> {
+        Box::pin(async move {
+            let attempt = self.fetch(plan.range).await;
+            let failure = attempt.logs.as_ref().err().map(|(failure, _)| *failure);
+            match failure.and_then(|failure| retry(failure, plan)) {
+                None => attempt,
+                Some(Retry::Wait(delay)) => {
+                    tokio::time::sleep(delay).await;
+                    self.settle(Plan {
+                        waits: plan.waits + 1,
+                        ..plan
+                    })
+                    .await
+                }
+                Some(Retry::Halve) => {
+                    self.settle(Plan {
+                        range: plan.range / 2,
+                        ..plan
+                    })
+                    .await
+                }
+            }
+        })
     }
 
     fn fetch(&self, range: u64) -> impl Future<Output = Attempt> + Send + use<N> {
@@ -158,16 +226,65 @@ impl<N: Network> RpcPages<N> {
             let logs = provider
                 .get_logs(&filter)
                 .await
-                .inspect_err(|err| tracing::debug!(error = %err, range, "eth_getLogs failed"))
                 .map(|logs| {
                     logs.into_iter()
                         .sorted_by_key(|log| (log.block_number, log.log_index))
                         .collect()
                 })
-                .map_err(transport);
+                .map_err(|err| {
+                    let failure = failure(&err);
+                    tracing::debug!(error = %err, range, ?failure, "eth_getLogs failed");
+                    (failure, transport(err))
+                });
             Attempt { range, end, logs }
         }
     }
+}
+
+fn retry(failure: Failure, plan: Plan) -> Option<Retry> {
+    match failure {
+        Failure::RateLimited if plan.waits < MAX_WAITS => Some(Retry::Wait(
+            FIRST_WAIT.saturating_mul(1 << plan.waits).min(MAX_WAIT),
+        )),
+        Failure::Rejected if plan.range > 1 => Some(Retry::Halve),
+        _ => None,
+    }
+}
+
+/// The range and streak for the next page after a page succeeded at `range`.
+fn grown(range: u64, streak: u32, max_range: u64) -> (u64, u32) {
+    if range < max_range && streak >= GROW_AFTER {
+        (range.saturating_mul(2).min(max_range), 0)
+    } else {
+        (range, streak)
+    }
+}
+
+/// alloy's own `is_retry_err` also retries JSON-RPC -32005, which Infura returns for too many logs too.
+fn failure(err: &RpcError<TransportErrorKind>) -> Failure {
+    let limited = match err {
+        RpcError::Transport(kind) => kind.is_retry_err(),
+        RpcError::ErrorResp(payload) => payload.code == 429 || rate_limit_message(&payload.message),
+        _ => false,
+    };
+    if limited {
+        Failure::RateLimited
+    } else {
+        Failure::Rejected
+    }
+}
+
+fn rate_limit_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "rate limit",
+        "rate exceeded",
+        "too many requests",
+        "credits limited",
+        "request limit reached",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
 }
 
 impl<N: Network> LogBackfill<N> for RpcBackfill {
@@ -197,6 +314,8 @@ impl<N: Network> LogBackfill<N> for RpcBackfill {
             start: from,
             to,
             range: self.max_range,
+            max_range: self.max_range,
+            streak: 0,
         };
         stream::try_unfold(pages, RpcPages::next)
     }
@@ -958,5 +1077,92 @@ mod tests {
 
         assert_eq!(pages.iter().map(Vec::len).collect_vec(), vec![1, 1, 0]);
         assert!(node.read_q().is_empty());
+    }
+
+    fn rejection(code: i64, message: &str) -> RpcError<TransportErrorKind> {
+        let payload = serde_json::json!({ "code": code, "message": message });
+        RpcError::ErrorResp(serde_json::from_value(payload).unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_pages_wait_out_a_rate_limit_without_shrinking_the_range() {
+        let node = Asserter::new();
+        let too_many = serde_json::json!({ "code": 429, "message": "Too Many Requests" });
+        node.push_failure(serde_json::from_value(too_many).unwrap());
+        node.push_success(&vec![log(1, 0xa, 1, false)]);
+        node.push_success(&Vec::<Log>::new());
+        let provider = DynProvider::new(ProviderBuilder::new().connect_mocked_client(node.clone()));
+
+        let pages: Vec<Vec<Log>> = Arc::new(RpcBackfill::new(4))
+            .pages(provider, Filter::new(), 1, 6)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(pages.iter().map(Vec::len).collect_vec(), vec![1, 0]);
+        assert!(node.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_pages_grow_back_to_max_range_after_a_streak() {
+        let node = Asserter::new();
+        node.push_failure_msg("range too large");
+        // 1..=2, 3..=4, 5..=6, 7..=8 at range 2, then 9..=30 in ranges of 4.
+        (0..10).for_each(|_| node.push_success(&Vec::<Log>::new()));
+        let provider = DynProvider::new(ProviderBuilder::new().connect_mocked_client(node.clone()));
+
+        let pages: Vec<Vec<Log>> = Arc::new(RpcBackfill::new(4))
+            .pages(provider, Filter::new(), 1, 30)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(pages.len(), 10);
+        assert!(node.read_q().is_empty());
+    }
+
+    #[test]
+    fn only_rate_limits_wait_and_too_many_logs_shrink_the_range() {
+        let http_429 = RpcError::Transport(TransportErrorKind::HttpError(
+            super::super::alloy::transports::HttpError {
+                status: 429,
+                body: String::new(),
+            },
+        ));
+        assert_eq!(failure(&http_429), Failure::RateLimited);
+        assert_eq!(
+            failure(&rejection(429, "Too Many Requests")),
+            Failure::RateLimited
+        );
+        assert_eq!(
+            failure(&rejection(
+                -32016,
+                "Your app has exceeded its compute units per second capacity, rate limit"
+            )),
+            Failure::RateLimited
+        );
+        assert_eq!(
+            failure(&rejection(-32005, "query returned more than 10000 results")),
+            Failure::Rejected
+        );
+        assert_eq!(
+            failure(&rejection(-32602, "Log response size exceeded")),
+            Failure::Rejected
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_doubles_up_to_the_cap_and_gives_up() {
+        let plan = |waits| Plan { range: 8, waits };
+        assert_eq!(
+            retry(Failure::RateLimited, plan(0)),
+            Some(Retry::Wait(Duration::from_secs(1)))
+        );
+        assert_eq!(
+            retry(Failure::RateLimited, plan(7)),
+            Some(Retry::Wait(MAX_WAIT))
+        );
+        assert_eq!(retry(Failure::RateLimited, plan(MAX_WAITS)), None);
+        assert_eq!(retry(Failure::Rejected, Plan { range: 1, waits: 0 }), None);
     }
 }
